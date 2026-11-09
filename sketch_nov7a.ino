@@ -11,6 +11,7 @@
 #include <Preferences.h>
 #include <FFat.h>
 #include <time.h>
+#include <stdio.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <IRremoteESP8266.h>
@@ -876,22 +877,76 @@ void logMapPoint() {
 }
 
 // =========================================================
-// Ping / Speed
+// Ping / Speed — cooperative state machine
 // =========================================================
-void runPingTest(const String&, const String&);
-void runSpeedTest(const String&, const String&);
+enum NetTestState : uint8_t {
+  NET_TEST_IDLE, NET_TEST_WIFI, NET_TEST_PING, NET_TEST_SPEED_CONNECT,
+  NET_TEST_SPEED_HEADERS, NET_TEST_SPEED_BODY
+};
+NetTestState netTestState = NET_TEST_IDLE;
+WiFiClient netTestClient;
 int pendingTestType = 0;
 String pendingSSID = "", pendingPass = "";
+uint32_t netTestStartedMs = 0, netTestNextMs = 0, netTestLastDataMs = 0;
+uint32_t netTestBodyBytes = 0, netTestBodyStartedMs = 0;
+bool netTestIsSpeed = false;
+char netTestStatusLine[32] = {0};
+uint8_t netTestStatusPos = 0;
+uint32_t netTestHeaderTail = 0;
+uint8_t netTestHeaderWindow[4] = {0};
 
-bool wifiConnectWait(const String& s, const String& p, uint32_t ms) {
+void drawTestPing();
+void drawTestSpeed();
+void startNetworkTest(bool speed) {
+  netTestClient.stop();
+  WiFi.disconnect(true);
   WiFi.mode(WIFI_STA);
-  if (p.length() > 0) WiFi.begin(s.c_str(), p.c_str());
-  else WiFi.begin(s.c_str());
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < ms) delay(100);
-  return WiFi.status() == WL_CONNECTED;
+  netTestIsSpeed = speed;
+  netTestStartedMs = millis();
+  netTestNextMs = netTestStartedMs;
+  netTestLastDataMs = netTestStartedMs;
+  netTestBodyBytes = 0;
+  netTestBodyStartedMs = 0;
+  netTestStatusPos = 0;
+  netTestHeaderTail = 0;
+  memset(netTestStatusLine, 0, sizeof(netTestStatusLine));
+  memset(netTestHeaderWindow, 0, sizeof(netTestHeaderWindow));
+  if (speed) {
+    speedKbps = 0;
+    speedCode = 0;
+    speedDone = false;
+  } else {
+    pingAttempts = 0;
+    pingOk = 0;
+    pingResult = 0;
+    pingDone = false;
+  }
+  netTestState = NET_TEST_WIFI;
+  if (pendingPass.length() > 0) WiFi.begin(pendingSSID.c_str(), pendingPass.c_str());
+  else WiFi.begin(pendingSSID.c_str());
+  if (speed) drawTestSpeed(); else drawTestPing();
 }
-
+void stopNetworkTest() {
+  netTestClient.stop();
+  if (netTestState != NET_TEST_IDLE) {
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+  }
+  netTestState = NET_TEST_IDLE;
+}
+void finishNetworkTest() {
+  netTestClient.stop();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  netTestState = NET_TEST_IDLE;
+  if (netTestIsSpeed) {
+    speedDone = true;
+    if (currentScreen == SCR_TEST_SPEED) drawTestSpeed();
+  } else {
+    pingDone = true;
+    if (currentScreen == SCR_TEST_PING) drawTestPing();
+  }
+}
 void drawKeyboard() {
   display.clearDisplay();
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
@@ -946,8 +1001,13 @@ void drawTestSavedList() {
   display.display();
 }
 void launchTest() {
-  if (pendingTestType == 0) { currentScreen = SCR_TEST_PING; runPingTest(pendingSSID, pendingPass); }
-  else { currentScreen = SCR_TEST_SPEED; runSpeedTest(pendingSSID, pendingPass); }
+  if (pendingTestType == 0) {
+    currentScreen = SCR_TEST_PING;
+    startNetworkTest(false);
+  } else {
+    currentScreen = SCR_TEST_SPEED;
+    startNetworkTest(true);
+  }
 }
 void startTestSetup(int type) {
   pendingTestType = type; testParentMenu = currentMenuIdx;
@@ -960,11 +1020,17 @@ void drawTestPing() {
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 0); display.print("Ping 8.8.8.8:53");
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
-  if (!pingDone) { display.setCursor(2, 24); display.print("Connecting..."); display.display(); return; }
+  if (!pingDone) {
+    display.setCursor(2, 22);
+    display.print(netTestState == NET_TEST_WIFI ? "Connecting WiFi..." : "Probe ");
+    if (netTestState != NET_TEST_WIFI) { display.print(pingAttempts); display.print("/5"); }
+    display.setCursor(2, 38); display.print("OK: "); display.print(pingOk);
+    display.display(); return;
+  }
   display.setCursor(2, 16); display.print("Attempts:"); display.print(pingAttempts);
   display.setCursor(2, 28); display.print("OK:"); display.print(pingOk);
   if (pingOk > 0) { display.setCursor(2, 40); display.print("Avg:"); display.print(pingResult / max(1UL, pingOk)); display.print(" ms"); }
-  else display.setCursor(2, 40); display.print("All failed");
+  else { display.setCursor(2, 40); display.print("All failed"); }
   display.setCursor(2, 56); display.print("M=rerun hL=new hM=out");
   display.display();
 }
@@ -973,68 +1039,131 @@ void drawTestSpeed() {
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 0); display.print("Speed Test (100KB)");
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
-  if (!speedDone) { display.setCursor(2, 24); display.print("Working..."); display.display(); return; }
+  if (!speedDone) {
+    display.setCursor(2, 24);
+    if (netTestState == NET_TEST_WIFI) display.print("Connecting WiFi...");
+    else if (netTestState == NET_TEST_SPEED_CONNECT) display.print("Connecting server...");
+    else { display.print("Received "); display.print(netTestBodyBytes / 1000); display.print(" KB"); }
+    display.display(); return;
+  }
   display.setCursor(2, 16); display.print("Speed:");
   display.setTextSize(2); display.setCursor(2, 28); display.print(speedKbps, 1); display.print(" kbps");
   display.setTextSize(1); display.setCursor(2, 48); display.print("HTTP: "); display.print(speedCode);
   display.setCursor(2, 56); display.print("M=rerun hL=new hM=out");
   display.display();
 }
-void runPingTest(const String &ssid, const String &pass) {
-  pingAttempts = 0; pingOk = 0; pingResult = 0; pingDone = false;
-  display.clearDisplay(); display.setCursor(2, 24); display.print("Connecting..."); display.display();
-  if (wifiConnectWait(ssid, pass, 10000)) {
-    addCred(ssid.c_str(), pass.c_str());
-    for (int i = 0; i < 5; i++) {
-      pingAttempts++;
-      WiFiClient c; uint32_t ts = millis();
-      if (c.connect("8.8.8.8", 53, 1000)) { pingResult += millis() - ts; pingOk++; c.stop(); }
-      delay(100);
-    }
+void tickNetworkTest() {
+  if (netTestState == NET_TEST_IDLE) return;
+  uint32_t now = millis();
+  if (now - netTestStartedMs > 25000) {
+    if (netTestIsSpeed && speedCode == 0) speedCode = -3;
+    finishNetworkTest();
+    return;
   }
-  WiFi.disconnect(); WiFi.mode(WIFI_OFF);
-  pingDone = true; drawTestPing();
-}
-void runSpeedTest(const String &ssid, const String &pass) {
-  speedKbps = 0; speedCode = 0; speedDone = false;
-  display.clearDisplay(); display.setCursor(2, 24); display.print("Connecting..."); display.display();
-  if (wifiConnectWait(ssid, pass, 10000)) {
-    addCred(ssid.c_str(), pass.c_str());
-    WiFiClient c;
-    if (c.connect("httpbin.org", 80, 5000)) {
-      c.print(F("GET /bytes/100000 HTTP/1.0\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"));
-      uint32_t ts = millis(), tb = 0, ld = millis();
-      bool hd = false; int mc = 0;
-      char statusLine[16] = {0};
-      int statusPos = 0;
-      while (c.connected() || c.available()) {
-        if (c.available()) {
-          if (!hd) {
-            char ch = c.read();
-            if (statusPos < 15) statusLine[statusPos++] = ch;
-            if (ch == '\r') mc = (mc == 0 || mc == 2) ? 1 : 0;
-            else if (ch == '\n') { if (mc == 1) mc = 2; else if (mc == 2) { hd = true; mc = 0; ts = millis(); } else mc = 0; }
-            else mc = 0;
-          } else {
-            char buf[64]; int av = c.available();
-            int n = c.readBytes(buf, av > 64 ? 64 : av); tb += n;
-          }
-          ld = millis();
-        } else { if (millis() - ld > 1000) break; delay(10); }
+
+  switch (netTestState) {
+    case NET_TEST_WIFI:
+      if (WiFi.status() == WL_CONNECTED) {
+        addCred(pendingSSID.c_str(), pendingPass.c_str());
+        netTestLastDataMs = now;
+        if (netTestIsSpeed) netTestState = NET_TEST_SPEED_CONNECT;
+        else netTestState = NET_TEST_PING;
+        netTestNextMs = now;
+      } else if (now - netTestStartedMs >= 12000) {
+        if (netTestIsSpeed) speedCode = -3;
+        finishNetworkTest();
+        return;
       }
-      uint32_t dt = millis() - ts; c.stop();
-      speedCode = -1;
-      for (int i = 0; i < statusPos - 3; i++) {
-        if (statusLine[i] == ' ' && statusLine[i+1] >= '1' && statusLine[i+1] <= '5') {
-          speedCode = 100 * (statusLine[i+1]-'0') + 10 * (statusLine[i+2]-'0') + (statusLine[i+3]-'0');
-          break;
+      break;
+
+    case NET_TEST_PING:
+      if (pingAttempts >= 5) { finishNetworkTest(); return; }
+      if ((int32_t)(now - netTestNextMs) >= 0) {
+        pingAttempts++;
+        WiFiClient probe;
+        uint32_t started = millis();
+        // Bounded connect keeps the UI responsive even when DNS/network is down.
+        if (probe.connect("8.8.8.8", 53, 250)) {
+          pingResult += millis() - started;
+          pingOk++;
+          probe.stop();
+        }
+        netTestNextMs = millis() + 200;
+      }
+      break;
+
+    case NET_TEST_SPEED_CONNECT:
+      if ((int32_t)(now - netTestNextMs) >= 0) {
+        if (!netTestClient.connect("httpbin.org", 80, 500)) {
+          speedCode = -2;
+          finishNetworkTest();
+          return;
+        }
+        netTestClient.print(F("GET /bytes/100000 HTTP/1.0\r\nHost: httpbin.org\r\nConnection: close\r\n\r\n"));
+        netTestLastDataMs = millis();
+        netTestState = NET_TEST_SPEED_HEADERS;
+      }
+      break;
+
+    case NET_TEST_SPEED_HEADERS:
+    case NET_TEST_SPEED_BODY: {
+      int budget = 256; // Limit work per loop pass so buttons/display keep running.
+      while (budget-- > 0 && netTestClient.available() > 0) {
+        int value = netTestClient.read();
+        if (value < 0) break;
+        uint8_t ch = (uint8_t)value;
+        netTestLastDataMs = millis();
+        if (netTestState == NET_TEST_SPEED_HEADERS) {
+          if (netTestStatusPos < sizeof(netTestStatusLine) - 1) {
+            netTestStatusLine[netTestStatusPos++] = (char)ch;
+          }
+          if (ch == '\n' && speedCode == 0) {
+            int code = 0;
+            if (sscanf(netTestStatusLine, "HTTP/%*s %d", &code) == 1) speedCode = code;
+          }
+          netTestHeaderWindow[netTestHeaderTail % 4] = ch;
+          netTestHeaderTail++;
+          if (netTestHeaderTail >= 4 &&
+              netTestHeaderWindow[(netTestHeaderTail - 4) % 4] == '\r' &&
+              netTestHeaderWindow[(netTestHeaderTail - 3) % 4] == '\n' &&
+              netTestHeaderWindow[(netTestHeaderTail - 2) % 4] == '\r' &&
+              netTestHeaderWindow[(netTestHeaderTail - 1) % 4] == '\n') {
+            netTestState = NET_TEST_SPEED_BODY;
+            netTestBodyStartedMs = millis();
+          }
+        } else {
+          netTestBodyBytes++;
+          if (netTestBodyBytes >= 100000) break;
         }
       }
-      if (dt > 0 && tb > 0 && speedCode > 0) speedKbps = (tb * 8.0f) / (dt / 1000.0f) / 1000.0f;
-    } else speedCode = -2;
+      if (netTestState == NET_TEST_SPEED_BODY && netTestBodyBytes >= 100000) {
+        uint32_t elapsed = millis() - netTestBodyStartedMs;
+        if (elapsed > 0 && speedCode >= 200 && speedCode < 300)
+          speedKbps = (netTestBodyBytes * 8.0f) / (elapsed / 1000.0f) / 1000.0f;
+        finishNetworkTest();
+        return;
+      }
+      if ((!netTestClient.connected() && netTestClient.available() == 0) ||
+          (now - netTestLastDataMs > 2500)) {
+        if (netTestBodyBytes > 0 && netTestBodyStartedMs > 0) {
+          uint32_t elapsed = millis() - netTestBodyStartedMs;
+          if (elapsed > 0 && speedCode >= 200 && speedCode < 300)
+            speedKbps = (netTestBodyBytes * 8.0f) / (elapsed / 1000.0f) / 1000.0f;
+        }
+        if (speedCode == 0) speedCode = -1;
+        finishNetworkTest();
+        return;
+      }
+      break;
+    }
+    default: break;
   }
-  WiFi.disconnect(); WiFi.mode(WIFI_OFF);
-  speedDone = true; drawTestSpeed();
+
+  static uint32_t lastDrawMs = 0;
+  if (now - lastDrawMs >= 400) {
+    lastDrawMs = now;
+    if (netTestIsSpeed) drawTestSpeed(); else drawTestPing();
+  }
 }
 
 // =========================================================
@@ -3031,15 +3160,17 @@ void handleTestScreen() {
     return;
   }
   if (currentScreen == SCR_TEST_PING) {
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeLong(btnLeft)) { currentScreen = SCR_TEST_SELECT_NET; startScan(); drawWifiListGeneric("Nets ", true); return; }
-    if (takeShort(btnSelect)) { runPingTest(pendingSSID, pendingPass); return; }
+    if (takeLong(btnSelect)) { stopNetworkTest(); currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft)) { stopNetworkTest(); currentScreen = SCR_TEST_SELECT_NET; startScan(); drawWifiListGeneric("Nets ", true); return; }
+    if (takeShort(btnSelect)) { startNetworkTest(false); return; }
+    tickNetworkTest();
     return;
   }
   if (currentScreen == SCR_TEST_SPEED) {
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeLong(btnLeft)) { currentScreen = SCR_TEST_SELECT_NET; startScan(); drawWifiListGeneric("Nets ", true); return; }
-    if (takeShort(btnSelect)) { runSpeedTest(pendingSSID, pendingPass); return; }
+    if (takeLong(btnSelect)) { stopNetworkTest(); currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft)) { stopNetworkTest(); currentScreen = SCR_TEST_SELECT_NET; startScan(); drawWifiListGeneric("Nets ", true); return; }
+    if (takeShort(btnSelect)) { startNetworkTest(true); return; }
+    tickNetworkTest();
     return;
   }
   // --- PWD ---
