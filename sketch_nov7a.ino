@@ -1,7 +1,8 @@
 // ============================================================
-// TRICORDER v24.0
+// TRICORDER v25.0
 // v23.1: новая клавиатура 10×4
 // v24.0: Games — Arcade/Logic/Cards/Idle
+// v25.0: atomic battery graph, battery saver, IR favorites, passive WiFi survey
 //        Tetris, Pong, Flappy, Doodle, Blackjack, BJ Multi, Farm
 // ============================================================
 #include <Wire.h>
@@ -233,6 +234,66 @@ bool irAutoRunning = false;
 uint32_t irAutoLast = 0;
 const char* keyNames[14] = { "PW","V+","V-","MU","C+","C-","UP","DN","<",">","OK","MN","BK","IN" };
 const int keyCount = 14;
+#define MAX_IR_FAVORITES 8
+#define IR_FAVORITE_EMPTY 0xFF
+struct IrFavorite { uint8_t isTv, devIdx, keyIdx; };
+static_assert(sizeof(IrFavorite) == 3, "IR favorite storage layout changed");
+IrFavorite irFavorites[MAX_IR_FAVORITES];
+int irFavoriteIdx = 0;
+int irFavoriteFeedback = 0;
+uint32_t irFavoriteFeedbackAt = 0;
+
+void clearIrFavorite(int i) {
+  irFavorites[i].isTv = 0;
+  irFavorites[i].devIdx = 0;
+  irFavorites[i].keyIdx = IR_FAVORITE_EMPTY;
+}
+void loadIrFavorites() {
+  for (int i = 0; i < MAX_IR_FAVORITES; i++) clearIrFavorite(i);
+  prefs.begin("irfav", true);
+  if (prefs.getBytesLength("data") == sizeof(irFavorites))
+    prefs.getBytes("data", irFavorites, sizeof(irFavorites));
+  prefs.end();
+  for (int i = 0; i < MAX_IR_FAVORITES; i++) {
+    IrFavorite &f = irFavorites[i];
+    int count = f.isTv ? irTvCount : irProjCount;
+    if (f.keyIdx >= keyCount || f.isTv > 1 || f.devIdx >= count ||
+        (f.keyIdx < keyCount && (f.isTv ? irTv[f.devIdx].keys[f.keyIdx] : irProj[f.devIdx].keys[f.keyIdx]) == 0))
+      clearIrFavorite(i);
+  }
+}
+bool saveIrFavorites() {
+  prefs.begin("irfav", false);
+  size_t written = prefs.putBytes("data", irFavorites, sizeof(irFavorites));
+  prefs.end();
+  return written == sizeof(irFavorites);
+}
+// Returns 1 when added, 2 if already saved, and 0 when empty/full/storage failed.
+int addIrFavorite(bool isTv, uint8_t devIdx, uint8_t keyIdx) {
+  int deviceCount = isTv ? irTvCount : irProjCount;
+  if (keyIdx >= keyCount || devIdx >= deviceCount) return 0;
+  const IrDevice &dev = isTv ? irTv[devIdx] : irProj[devIdx];
+  if (!dev.keys[keyIdx]) return 0;
+  int empty = -1;
+  for (int i = 0; i < MAX_IR_FAVORITES; i++) {
+    IrFavorite &f = irFavorites[i];
+    if (f.keyIdx == keyIdx && f.isTv == (isTv ? 1 : 0) && f.devIdx == devIdx) return 2;
+    if (empty < 0 && f.keyIdx == IR_FAVORITE_EMPTY) empty = i;
+  }
+  if (empty < 0) return 0;
+  irFavorites[empty] = { (uint8_t)(isTv ? 1 : 0), devIdx, keyIdx };
+  if (!saveIrFavorites()) { clearIrFavorite(empty); return 0; }
+  return 1;
+}
+bool removeIrFavorite(int i) {
+  if (i < 0 || i >= MAX_IR_FAVORITES || irFavorites[i].keyIdx == IR_FAVORITE_EMPTY) return false;
+  IrFavorite old = irFavorites[i];
+  clearIrFavorite(i);
+  if (saveIrFavorites()) return true;
+  irFavorites[i] = old;
+  return false;
+}
+void setIrNavigationOnRelease(bool onRelease);
 
 void sendIR(const IrDevice& dev, int key) {
   uint32_t code = dev.keys[key];
@@ -345,6 +406,9 @@ bool battFirstDone = false, fatReady = false, battValid = false;
 float battVoltage = 0.0f;
 int battPct = -1;
 uint32_t lastBattMs = 0, lastBtnEventMs = 0;
+#define LOW_BATTERY_WARN_PCT 15
+#define DISPLAY_SLEEP_MS 90000UL
+bool displaySleeping = false;
 
 float readBatteryVoltage() {
   const int N = 9;
@@ -368,30 +432,117 @@ int battPercentFromV(float v) {
   if (v >= 3.30f) return (int)((v - 3.30f) / 0.10f * 5);
   return 0;
 }
-void loadBattGraph() {
-  if (!fatReady) return;
-  File f = FFat.open("/batt.bin", "r");
-  if (!f) return;
-  f.read((uint8_t*)battGraph, sizeof(battGraph));
-  f.read((uint8_t*)&battGraphIdx, sizeof(battGraphIdx));
-  f.read((uint8_t*)&battGraphCount, sizeof(battGraphCount));
+#define BATT_FILE_HEADER_SIZE 9
+#define BATT_FILE_SIZE (BATT_FILE_HEADER_SIZE + BG_POINTS + 4)
+
+uint32_t battGraphCrc32(const uint8_t* data, size_t len) {
+  uint32_t crc = 0xFFFFFFFFUL;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (uint8_t bit = 0; bit < 8; bit++)
+      crc = (crc >> 1) ^ (0xEDB88320UL & (-(int32_t)(crc & 1)));
+  }
+  return ~crc;
+}
+bool validBattGraphSamples(const int8_t* samples) {
+  for (int i = 0; i < BG_POINTS; i++)
+    if (samples[i] < -1 || samples[i] > 100) return false;
+  return true;
+}
+bool readBattGraphFile(const char* path, bool allowLegacy, bool* wasLegacy = nullptr) {
+  File f = FFat.open(path, "r");
+  if (!f) return false;
+  size_t size = f.size();
+  if (size == BATT_FILE_SIZE) {
+    uint8_t data[BATT_FILE_SIZE];
+    bool ok = (f.read(data, sizeof(data)) == sizeof(data));
+    f.close();
+    if (!ok || memcmp(data, "BTG2", 4) != 0 || data[4] != 2) return false;
+    uint32_t storedCrc = (uint32_t)data[BATT_FILE_SIZE - 4] |
+                         ((uint32_t)data[BATT_FILE_SIZE - 3] << 8) |
+                         ((uint32_t)data[BATT_FILE_SIZE - 2] << 16) |
+                         ((uint32_t)data[BATT_FILE_SIZE - 1] << 24);
+    if (battGraphCrc32(data, BATT_FILE_SIZE - 4) != storedCrc) return false;
+    uint16_t idx = (uint16_t)data[5] | ((uint16_t)data[6] << 8);
+    uint16_t count = (uint16_t)data[7] | ((uint16_t)data[8] << 8);
+    int8_t samples[BG_POINTS];
+    memcpy(samples, data + BATT_FILE_HEADER_SIZE, BG_POINTS);
+    if (idx >= BG_POINTS || count > BG_POINTS || !validBattGraphSamples(samples)) return false;
+    memcpy(battGraph, samples, BG_POINTS);
+    battGraphIdx = idx;
+    battGraphCount = count;
+    if (wasLegacy) *wasLegacy = false;
+    return true;
+  }
+  // v24 legacy layout on ESP32: 96 samples followed by two 32-bit ints.
+  if (allowLegacy && size == BG_POINTS + 8) {
+    int32_t idx = 0, count = 0;
+    int8_t samples[BG_POINTS];
+    bool ok = (f.read((uint8_t*)samples, BG_POINTS) == BG_POINTS) &&
+              (f.read((uint8_t*)&idx, sizeof(idx)) == sizeof(idx)) &&
+              (f.read((uint8_t*)&count, sizeof(count)) == sizeof(count));
+    f.close();
+    if (!ok || idx < 0 || idx >= BG_POINTS || count < 0 || count > BG_POINTS ||
+        !validBattGraphSamples(samples)) return false;
+    memcpy(battGraph, samples, BG_POINTS);
+    battGraphIdx = idx;
+    battGraphCount = count;
+    if (wasLegacy) *wasLegacy = true;
+    return true;
+  }
   f.close();
-  if (battGraphCount > BG_POINTS) battGraphCount = 0;
-  if (battGraphIdx >= BG_POINTS) battGraphIdx = 0;
+  return false;
 }
 void saveBattGraph() {
   if (!fatReady) return;
-  File f = FFat.open("/batt.bin", "w");
+  uint8_t data[BATT_FILE_SIZE] = { 'B', 'T', 'G', '2', 2, 0, 0, 0, 0 };
+  uint16_t idx = (uint16_t)constrain(battGraphIdx, 0, BG_POINTS - 1);
+  uint16_t count = (uint16_t)constrain(battGraphCount, 0, BG_POINTS);
+  data[5] = idx & 0xFF; data[6] = idx >> 8;
+  data[7] = count & 0xFF; data[8] = count >> 8;
+  memcpy(data + BATT_FILE_HEADER_SIZE, battGraph, BG_POINTS);
+  uint32_t crc = battGraphCrc32(data, BATT_FILE_SIZE - 4);
+  data[BATT_FILE_SIZE - 4] = crc & 0xFF;
+  data[BATT_FILE_SIZE - 3] = (crc >> 8) & 0xFF;
+  data[BATT_FILE_SIZE - 2] = (crc >> 16) & 0xFF;
+  data[BATT_FILE_SIZE - 1] = (crc >> 24) & 0xFF;
+
+  File f = FFat.open("/batt.new", "w");
   if (!f) return;
-  f.write((uint8_t*)battGraph, sizeof(battGraph));
-  f.write((uint8_t*)&battGraphIdx, sizeof(battGraphIdx));
-  f.write((uint8_t*)&battGraphCount, sizeof(battGraphCount));
+  size_t written = f.write(data, sizeof(data));
+  f.flush();
   f.close();
+  if (written != sizeof(data) || !readBattGraphFile("/batt.new", false)) {
+    FFat.remove("/batt.new");
+    return;
+  }
+
+  // The fully written and CRC-checked .new file remains recoverable while replacing the old one.
+  if (FFat.exists("/batt.bin") && !FFat.remove("/batt.bin")) return;
+  if (!FFat.rename("/batt.new", "/batt.bin")) return;
+  if (FFat.exists("/batt.tmp")) FFat.remove("/batt.tmp");
+  if (FFat.exists("/batt.bak")) FFat.remove("/batt.bak");
+}
+void loadBattGraph() {
+  if (!fatReady) return;
+  memset(battGraph, 0, sizeof(battGraph));
+  battGraphIdx = 0; battGraphCount = 0;
+  bool legacy = false;
+  if (readBattGraphFile("/batt.bin", false)) return;
+  if (readBattGraphFile("/batt.new", false)) {
+    if (FFat.exists("/batt.bin")) FFat.remove("/batt.bin");
+    FFat.rename("/batt.new", "/batt.bin");
+    return;
+  }
+  if (readBattGraphFile("/batt.tmp", false)) return; // legacy recovery file from earlier builds
+  if (readBattGraphFile("/batt.bak", false)) return;
+  if (readBattGraphFile("/batt.bin", true, &legacy) && legacy) saveBattGraph();
 }
 void clearBattGraph() { memset(battGraph, 0, sizeof(battGraph)); battGraphIdx = 0; battGraphCount = 0; saveBattGraph(); }
 void updateBattery() {
   uint32_t now = millis();
-  if (now - lastBattMs < 500 || now - lastBtnEventMs < 150) return;
+  uint32_t readInterval = displaySleeping ? 5000UL : 500UL;
+  if (now - lastBattMs < readInterval || now - lastBtnEventMs < 150) return;
   lastBattMs = now;
   bool radioBusy = (scanMode == SCAN_ON) || (ntpState != NTP_IDLE) ||
                    deauthRunning || cloneRunning || spamRunning || snifferRunning;
@@ -424,6 +575,10 @@ void drawBatteryIcon(int x, int y) {
   if (!battValid) { display.drawLine(x + 1, y + 5, x + 10, y + 1, SSD1306_WHITE); return; }
   int fp = map(battPct, 0, 100, 0, 10);
   if (fp > 0) display.fillRect(x + 1, y + 1, fp, 4, SSD1306_WHITE);
+  if (battPct <= LOW_BATTERY_WARN_PCT) {
+    display.drawFastVLine(x + 8, y + 1, 3, SSD1306_WHITE);
+    display.drawPixel(x + 8, y + 5, SSD1306_WHITE);
+  }
 }
 
 // ---- Buttons ----
@@ -457,6 +612,10 @@ bool takeShort(Btn &b) { if (b.shortEvent) { b.shortEvent = false; return true; 
 bool takeLong(Btn &b) { if (b.longEvent) { b.longEvent = false; return true; } return false; }
 void suppressLong(Btn &b) { b.longFired = true; b.longEvent = false; b.shortEvent = false; }
 void suppressAll() { suppressLong(btnLeft); suppressLong(btnRight); suppressLong(btnSelect); }
+void setIrNavigationOnRelease(bool onRelease) {
+  btnLeft.fireOnPress = !onRelease;
+  btnRight.fireOnPress = !onRelease;
+}
 bool anyBtnEvent() { return btnLeft.shortEvent || btnLeft.longEvent || btnRight.shortEvent || btnRight.longEvent || btnSelect.shortEvent || btnSelect.longEvent; }
 
 // ---- Input / keyboard ----
@@ -484,10 +643,10 @@ void startInput(const char* lb, String* t, int ml, int a, const char* c = "") {
 // ---- Menus ----
 const char* mainItems[] = { "WiFi","Proj","TV","Tools","Security","Games","System" };
 const char* wifiItems[] = { "Scan","Channels","Analyze","Test","Attacks","Map" };
-const char* analyzeItems[] = { "Hidden","Twins" };
+const char* analyzeItems[] = { "Hidden","Twins","Signal" };
 const char* testItems[] = { "Ping","Speed" };
 const char* attackItems[] = { "Clone","Spam" };
-const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro" };
+const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav" };
 const char* secItems[] = { "Passwords","Sniffer" };
 // v24.1: плоский Games (10 пунктов)
 const char* gamesItems[] = { "Snake","Pong","Flappy","Doodle","Mines","2048","Simon","Tetris","BJ","Farm" };
@@ -497,10 +656,10 @@ struct MenuLevel { const char* title; const char** items; int count; int index; 
 MenuLevel menus[] = {
   { "MAIN",     mainItems,    7, 0, -1 },
   { "WiFi",     wifiItems,    6, 0,  0 },
-  { "Analyze",  analyzeItems, 2, 0,  1 },
+  { "Analyze",  analyzeItems, 3, 0,  1 },
   { "Test",     testItems,    2, 0,  1 },
   { "Attacks",  attackItems,  2, 0,  1 },
-  { "Tools",    toolsItems,   6, 0,  0 },
+  { "Tools",    toolsItems,   7, 0,  0 },
   { "Security", secItems,     2, 0,  0 },
   { "Games",    gamesItems,   10, 0, 0 },
   { "System",   systemItems,  2, 0,  0 },
@@ -510,13 +669,13 @@ int currentMenuIdx = 0;
 enum Screen {
   SCR_MENU,
   SCR_WIFI_SCAN, SCR_WIFI_CHANNELS, SCR_WIFI_DETAIL, SCR_WIFI_MAP_SEL, SCR_WIFI_MAP,
-  SCR_ANALYZE_HIDDEN, SCR_ANALYZE_TWINS,
+  SCR_ANALYZE_HIDDEN, SCR_ANALYZE_TWINS, SCR_ANALYZE_SIGNAL,
   SCR_TEST_SAVED_LIST, SCR_TEST_SELECT_NET, SCR_INPUT,
   SCR_TEST_PING, SCR_TEST_SPEED,
   SCR_PWD_LIST, SCR_PWD_DETAIL, SCR_PWD_DELETE_CONFIRM, SCR_PWD_HELP, SCR_PWD_QR,
   SCR_ATTACK_DEAUTH_SEL, SCR_ATTACK_DEAUTH_RUN,
   SCR_ATTACK_CLONE_SEL, SCR_ATTACK_CLONE_RUN, SCR_ATTACK_SPAM_RUN,
-  SCR_IR_POWER, SCR_IR_TV, SCR_IR_KEYS, SCR_IR_AUTO,
+  SCR_IR_POWER, SCR_IR_TV, SCR_IR_KEYS, SCR_IR_AUTO, SCR_IR_FAVORITES,
   SCR_TOOLS_RANDOM, SCR_TOOLS_PASSWORD, SCR_TOOLS_BATTERY, SCR_TOOLS_BATTCAL, SCR_TOOLS_CLOCK,
   SCR_TOOLS_MACRO, SCR_TOOLS_MACRO_EDIT,
   SCR_MINES, SCR_SNAKE, SCR_2048, SCR_SIMON,
@@ -577,6 +736,10 @@ void drawCurrentMenu() {
   display.clearDisplay();
   drawMenuChrome(menus[currentMenuIdx].index);
   drawCenteredText(menus[currentMenuIdx].items[menus[currentMenuIdx].index], 18, 0, 2);
+  if (battValid && battPct <= LOW_BATTERY_WARN_PCT) {
+    display.setTextSize(1); display.setCursor(2, 56);
+    display.print("LOW BATTERY "); display.print(battPct); display.print("%");
+  }
   display.display();
 }
 void drawAnimFrame() {
@@ -600,7 +763,16 @@ void startAnim(int dir, int ni) {
 // WiFi
 // =========================================================
 #define MAX_APS 20
-struct WifiAp { char ssid[33]; int rssi; int channel; char bssid[18]; int enc; bool hidden; uint8_t bssidRaw[6]; };
+#define RSSI_HISTORY_POINTS 12
+struct WifiAp {
+  char ssid[33]; int rssi; int channel; char bssid[18]; int enc; bool hidden; uint8_t bssidRaw[6];
+  int8_t rssiHistory[RSSI_HISTORY_POINTS]; uint8_t rssiCount; uint8_t rssiNext;
+};
+void pushRssiSample(WifiAp& ap, int rssi) {
+  ap.rssiHistory[ap.rssiNext] = (int8_t)constrain(rssi, -127, 0);
+  ap.rssiNext = (ap.rssiNext + 1) % RSSI_HISTORY_POINTS;
+  if (ap.rssiCount < RSSI_HISTORY_POINTS) ap.rssiCount++;
+}
 WifiAp wifiAps[MAX_APS];
 int wifiApCount = 0;
 int scanCh = 1, wifiScrollIdx = 0;
@@ -628,14 +800,19 @@ bool tickScan() {
     String b = WiFi.BSSIDstr(i);
     int ex = -1;
     for (int j = 0; j < wifiApCount; j++) if (!strcmp(wifiAps[j].bssid, b.c_str())) { ex = j; break; }
-    if (ex >= 0) wifiAps[ex].rssi = WiFi.RSSI(i);
+    if (ex >= 0) {
+      wifiAps[ex].rssi = WiFi.RSSI(i);
+      pushRssiSample(wifiAps[ex], wifiAps[ex].rssi);
+    }
     else if (wifiApCount < MAX_APS) {
       WifiAp &a = wifiAps[wifiApCount++];
+      memset(&a, 0, sizeof(a));
       String s = WiFi.SSID(i); a.hidden = (s.length() == 0); if (a.hidden) s = "(hidden)";
       strncpy(a.ssid, s.c_str(), 32); a.ssid[32] = 0;
       strncpy(a.bssid, b.c_str(), 17); a.bssid[17] = 0;
       WiFi.BSSID(i, a.bssidRaw);
       a.rssi = WiFi.RSSI(i); a.channel = WiFi.channel(i); a.enc = WiFi.encryptionType(i);
+      pushRssiSample(a, a.rssi);
     }
   }
   WiFi.scanDelete(); scanCh++; if (scanCh > 13) scanCh = 1;
@@ -700,28 +877,37 @@ void drawWifiDetail() {
   if (ss > 1) { display.setCursor(2, 54); display.print("APs:"); display.print(ss); }
   display.display();
 }
-int findBestChannel() {
-  int per[14] = {0};
-  for (int i = 0; i < wifiApCount; i++) { int c = wifiAps[i].channel; if (c >= 1 && c <= 13) per[c]++; }
-  int bc = 1, bs = per[1] + per[2] + per[3];
-  int cand[] = {1, 6, 11};
-  for (int k = 0; k < 3; k++) {
-    int c = cand[k], sc = per[c];
-    if (c > 1) sc += per[c - 1];
-    if (c < 13) sc += per[c + 1];
-    if (sc < bs) { bs = sc; bc = c; }
+int channelLoadEstimate(int centerChannel) {
+  // Relative 2.4 GHz congestion estimate from nearby AP count and RSSI; not airtime utilization.
+  const uint8_t overlapWeight[5] = {5, 4, 3, 2, 1};
+  int load = 0;
+  for (int i = 0; i < wifiApCount; i++) {
+    int delta = abs(wifiAps[i].channel - centerChannel);
+    if (delta > 4) continue;
+    int signalWeight = constrain(map(wifiAps[i].rssi, -100, -40, 1, 5), 1, 5);
+    load += overlapWeight[delta] * signalWeight;
   }
-  return bc;
+  return load;
+}
+int findBestChannel() {
+  const int candidates[] = {1, 6, 11};
+  int best = candidates[0];
+  int bestLoad = channelLoadEstimate(best);
+  for (int i = 1; i < 3; i++) {
+    int load = channelLoadEstimate(candidates[i]);
+    if (load < bestLoad) { bestLoad = load; best = candidates[i]; }
+  }
+  return best;
 }
 void drawWifiChannels() {
   display.clearDisplay();
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0); display.print("Channels 1-13");
+  display.setCursor(2, 0); display.print("Load est 2.4G");
   if (wifiApCount > 0) { int b = findBestChannel(); display.setCursor(SW - 42, 0); display.print("B:"); display.print(b); }
   drawBatteryIcon(SW - 14, 1);
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
   int per[14] = {0};
-  for (int i = 0; i < wifiApCount; i++) { int c = wifiAps[i].channel; if (c >= 1 && c <= 13) per[c]++; }
+  for (int c = 1; c <= 13; c++) per[c] = channelLoadEstimate(c);
   int mx = 1;
   for (int c = 1; c <= 13; c++) if (per[c] > mx) mx = per[c];
   int bCh = (wifiApCount > 0) ? findBestChannel() : -1;
@@ -738,7 +924,7 @@ void drawWifiChannels() {
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 56);
   if (scanMode == SCAN_ON) { display.print("ch"); display.print(scanCh); display.print(" scan"); }
-  else { display.print(wifiApCount); display.print(" APs"); }
+  else { display.print(wifiApCount); display.print(" APs est"); }
   display.display();
 }
 void drawAnalyzeHidden() {
@@ -781,6 +967,73 @@ void drawAnalyzeTwins() {
   }
   if (g == 0) { display.setCursor(2, 30); display.print(scanMode == SCAN_ON ? "Scanning..." : "No twins"); }
   display.display();
+}
+void drawAnalyzeSignal() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0); display.print("Signal ");
+  if (wifiApCount > 0) { wifiScrollIdx = constrain(wifiScrollIdx, 0, wifiApCount - 1); display.print(wifiScrollIdx + 1); display.print("/"); }
+  display.print(wifiApCount);
+  if (scanMode == SCAN_ON) { display.setCursor(72, 0); display.print("ch"); display.print(scanCh); }
+  drawBatteryIcon(SW - 14, 1);
+  display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
+  if (wifiApCount == 0) {
+    display.setCursor(2, 26); display.print(scanMode == SCAN_ON ? "Collecting APs..." : "No networks");
+  } else {
+    WifiAp &ap = wifiAps[wifiScrollIdx];
+    char name[20]; strncpy(name, ap.ssid, 18); name[18] = 0;
+    display.setCursor(2, 13); display.print(name);
+    display.setCursor(2, 23); display.print("RSSI "); display.print(ap.rssi); display.print(" dBm ch"); display.print(ap.channel);
+    if (ap.rssiCount > 0) {
+      int first = (ap.rssiCount == RSSI_HISTORY_POINTS) ? ap.rssiNext : 0;
+      int rssiMin = 0, rssiMax = -127;
+      for (int i = 0; i < ap.rssiCount; i++) {
+        int v = ap.rssiHistory[(first + i) % RSSI_HISTORY_POINTS];
+        if (i == 0 || v < rssiMin) rssiMin = v;
+        if (v > rssiMax) rssiMax = v;
+      }
+      display.setCursor(2, 32); display.print("min "); display.print(rssiMin); display.print(" max "); display.print(rssiMax);
+      const int gx = 4, gy = 41, gw = 120, gh = 10;
+      display.drawRect(gx - 1, gy - 1, gw + 2, gh + 2, SSD1306_WHITE);
+      int px = -1, py = -1;
+      for (int i = 0; i < ap.rssiCount; i++) {
+        int v = ap.rssiHistory[(first + i) % RSSI_HISTORY_POINTS];
+        int x = gx + (ap.rssiCount <= 1 ? gw / 2 : (i * (gw - 1)) / (ap.rssiCount - 1));
+        int y = gy + gh - constrain(map(v, -100, -35, 0, gh), 0, gh);
+        if (px >= 0) display.drawLine(px, py, x, y, SSD1306_WHITE);
+        else display.drawPixel(x, y, SSD1306_WHITE);
+        px = x; py = y;
+      }
+    } else { display.setCursor(2, 36); display.print("Waiting for samples"); }
+  }
+  display.setCursor(2, 56); display.print("M=CSV L/R=AP hM=out");
+  display.display();
+}
+void printCsvField(const char* value) {
+  Serial.print('"');
+  for (const char* p = value; *p; p++) {
+    if (*p == '"') Serial.print('"');
+    if (*p == '\r') Serial.print(F("\\r"));
+    else if (*p == '\n') Serial.print(F("\\n"));
+    else Serial.print(*p);
+  }
+  Serial.print('"');
+}
+void exportWifiSurveyCsv() {
+  Serial.println(F("ssid,bssid,channel,rssi_dbm,samples,rssi_01,rssi_02,rssi_03,rssi_04,rssi_05,rssi_06,rssi_07,rssi_08,rssi_09,rssi_10,rssi_11,rssi_12"));
+  for (int i = 0; i < wifiApCount; i++) {
+    WifiAp &ap = wifiAps[i];
+    printCsvField(ap.ssid); Serial.print(','); printCsvField(ap.bssid);
+    Serial.print(','); Serial.print(ap.channel);
+    Serial.print(','); Serial.print(ap.rssi);
+    Serial.print(','); Serial.print(ap.rssiCount);
+    int first = (ap.rssiCount == RSSI_HISTORY_POINTS) ? ap.rssiNext : 0;
+    for (int j = 0; j < RSSI_HISTORY_POINTS; j++) {
+      Serial.print(',');
+      if (j < ap.rssiCount) Serial.print((int)ap.rssiHistory[(first + j) % RSSI_HISTORY_POINTS]);
+    }
+    Serial.println();
+  }
 }
 
 // ---- WiFi Map ----
@@ -1372,8 +1625,14 @@ void drawIrKeys() {
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 56);
   if (macroRecording) display.print("M=add step hL=cancel");
+  else if (irFavoriteFeedback && millis() - irFavoriteFeedbackAt < 1500) {
+    if (irFavoriteFeedback == 1) display.print("FAVORITE SAVED");
+    else if (irFavoriteFeedback == 2) display.print("ALREADY SAVED");
+    else if (irFavoriteFeedback == 4) display.print("NO IR CODE");
+    else display.print("FAVORITES FULL");
+  }
   else if (irSent && millis() - irSentAt < 800) display.print("SENT!");
-  else display.print("M=send hL=back");
+  else display.print("M=send holdR=fav");
   display.display();
 }
 void drawIrAuto() {
@@ -1392,6 +1651,37 @@ void drawIrAuto() {
   display.setTextSize(2); display.setCursor(2, 34); display.print(name);
   display.setTextSize(1); display.setCursor(2, 56);
   display.print(irAutoRunning ? "MID=stop" : "MID=start  hM=out");
+  display.display();
+}
+const IrDevice* getIrFavoriteDevice(const IrFavorite& f) {
+  if (f.keyIdx >= keyCount || f.isTv > 1) return nullptr;
+  if (f.isTv) return f.devIdx < irTvCount ? &irTv[f.devIdx] : nullptr;
+  return f.devIdx < irProjCount ? &irProj[f.devIdx] : nullptr;
+}
+void drawIrFavorites() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0); display.print("IR Favorites ");
+  display.print(irFavoriteIdx + 1); display.print("/"); display.print(MAX_IR_FAVORITES);
+  drawBatteryIcon(SW - 14, 1);
+  display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
+  int start = listStart(irFavoriteIdx, MAX_IR_FAVORITES, 4);
+  for (int row = 0; row < 4; row++) {
+    int idx = start + row;
+    int y = 13 + row * 10;
+    bool selected = idx == irFavoriteIdx;
+    if (selected) display.fillRect(0, y - 1, SW, 9, SSD1306_WHITE);
+    display.setTextColor(selected ? SSD1306_BLACK : SSD1306_WHITE);
+    display.setCursor(2, y); display.print(idx + 1); display.print(": ");
+    const IrDevice* dev = getIrFavoriteDevice(irFavorites[idx]);
+    if (!dev) display.print("(empty)");
+    else {
+      char name[10]; strncpy(name, dev->name, 8); name[8] = 0;
+      display.print(name); display.print(" "); display.print(keyNames[irFavorites[idx].keyIdx]);
+    }
+  }
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 56); display.print("M=send hL=del hM=out");
   display.display();
 }
 void stepIrAuto() {
@@ -1426,7 +1716,7 @@ void drawMacroSel() {
   }
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 56);
-  if (macroPlaying) display.print("PLAYING...");
+  if (macroPlaying) display.print("M=stop PLAYING");
   else if (macros[macroSelIdx].nSteps == 0) display.print("M=edit hL=out");
   else display.print("M=play hM=edit hL=out");
   display.display();
@@ -1467,7 +1757,7 @@ void drawMacroEdit() {
   }
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 56);
-  if (macroPlaying) display.print("PLAYING...");
+  if (macroPlaying) display.print("M=stop hM=back");
   else if (macroEditIdx < m.nSteps) display.print("M=send hL=del hM=back");
   else display.print("M=ok hM=back");
   display.display();
@@ -1526,7 +1816,9 @@ void drawToolsBattery() {
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
   if (battGraphCount == 0) {
     display.setCursor(20, 30); display.print("No data yet");
-    display.setCursor(2, 56); display.print("hL=clear");
+    display.setCursor(2, 56);
+    if (battValid && battPct <= LOW_BATTERY_WARN_PCT) display.print("LOW! hL=clear");
+    else display.print("hL=clear");
     display.display(); return;
   }
   int gx = 4, gy = 14, gw = 120, gh = 32;
@@ -1542,7 +1834,9 @@ void drawToolsBattery() {
     px = x; py = y;
   }
   display.setCursor(2, 48); display.print(battGraphCount); display.print(" pts (5min)");
-  display.setCursor(2, 56); display.print("hL=clear");
+  display.setCursor(2, 56);
+  if (battValid && battPct <= LOW_BATTERY_WARN_PCT) display.print("LOW! hL=clear");
+  else display.print("hL=clear");
   display.display();
 }
 void drawToolsBattCal() {
@@ -2620,13 +2914,14 @@ void drawStars() {
 // =========================================================
 // Menu logic
 // =========================================================
+void drawIrFavorites();
 void enterSelected() {
   int idx = menus[currentMenuIdx].index;
   testParentMenu = currentMenuIdx;
   if (currentMenuIdx == 0) {
     if (idx == 0) { currentMenuIdx = 1; menus[1].index = 0; drawCurrentMenu(); }
-    else if (idx == 1) { irProjIdx = 0; currentScreen = SCR_IR_POWER; drawIrProj(); }
-    else if (idx == 2) { irTvIdx = 0; currentScreen = SCR_IR_TV; drawIrTv(); }
+    else if (idx == 1) { setIrNavigationOnRelease(false); irProjIdx = 0; currentScreen = SCR_IR_POWER; drawIrProj(); }
+    else if (idx == 2) { setIrNavigationOnRelease(false); irTvIdx = 0; currentScreen = SCR_IR_TV; drawIrTv(); }
     else if (idx == 3) { currentMenuIdx = 5; menus[5].index = 0; drawCurrentMenu(); }
     else if (idx == 4) { currentMenuIdx = 6; menus[6].index = 0; drawCurrentMenu(); }
     else if (idx == 5) { currentMenuIdx = 7; menus[7].index = 0; drawCurrentMenu(); }
@@ -2643,6 +2938,7 @@ void enterSelected() {
   else if (currentMenuIdx == 2) {
     if (idx == 0) { currentScreen = SCR_ANALYZE_HIDDEN; startScan(); drawAnalyzeHidden(); }
     if (idx == 1) { currentScreen = SCR_ANALYZE_TWINS; startScan(); drawAnalyzeTwins(); }
+    if (idx == 2) { wifiScrollIdx = 0; currentScreen = SCR_ANALYZE_SIGNAL; startScan(); drawAnalyzeSignal(); }
   }
   else if (currentMenuIdx == 3) {
     if (idx == 0) startTestSetup(0);
@@ -2663,6 +2959,7 @@ void enterSelected() {
     }
     if (idx == 4) { currentScreen = SCR_TOOLS_CLOCK; drawToolsClock(); }
     if (idx == 5) { macroSelIdx = 0; currentScreen = SCR_TOOLS_MACRO; drawMacroSel(); }
+    if (idx == 6) { irFavoriteIdx = 0; setIrNavigationOnRelease(true); currentScreen = SCR_IR_FAVORITES; drawIrFavorites(); }
   }
   else if (currentMenuIdx == 6) {
     if (idx == 0) { pwdListIdx = 0; currentScreen = SCR_PWD_LIST; drawPwdList(); }
@@ -2929,7 +3226,7 @@ void handleTestScreen() {
     if (takeLong(btnLeft)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
     if (takeShort(btnLeft) && irProjIdx > 0) { irProjIdx--; drawIrProj(); return; }
     if (takeShort(btnRight) && irProjIdx < irProjCount - 1) { irProjIdx++; drawIrProj(); return; }
-    if (takeShort(btnSelect)) { irKeyDevice = irProjIdx; irKeyIsTv = false; irKeyIdx = 0; currentScreen = SCR_IR_KEYS; drawIrKeys(); return; }
+    if (takeShort(btnSelect)) { irKeyDevice = irProjIdx; irKeyIsTv = false; irKeyIdx = 0; setIrNavigationOnRelease(true); currentScreen = SCR_IR_KEYS; drawIrKeys(); return; }
     if (takeLong(btnSelect)) { irAutoIdx = 0; irAutoRunning = true; irAutoLast = millis() - 1500; currentScreen = SCR_IR_AUTO; drawIrAuto(); return; }
     return;
   }
@@ -2949,7 +3246,7 @@ void handleTestScreen() {
     if (takeLong(btnLeft)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
     if (takeShort(btnLeft) && irTvIdx > 0) { irTvIdx--; drawIrTv(); return; }
     if (takeShort(btnRight) && irTvIdx < irTvCount - 1) { irTvIdx++; drawIrTv(); return; }
-    if (takeShort(btnSelect)) { irKeyDevice = irTvIdx; irKeyIsTv = true; irKeyIdx = 0; currentScreen = SCR_IR_KEYS; drawIrKeys(); return; }
+    if (takeShort(btnSelect)) { irKeyDevice = irTvIdx; irKeyIsTv = true; irKeyIdx = 0; setIrNavigationOnRelease(true); currentScreen = SCR_IR_KEYS; drawIrKeys(); return; }
     if (takeLong(btnSelect)) { irAutoIdx = irProjCount; irAutoRunning = true; irAutoLast = millis() - 1500; currentScreen = SCR_IR_AUTO; drawIrAuto(); return; }
     return;
   }
@@ -2957,22 +3254,30 @@ void handleTestScreen() {
   if (currentScreen == SCR_IR_KEYS) {
     const IrDevice* dev = irKeyIsTv ? &irTv[irKeyDevice] : &irProj[irKeyDevice];
     if (macroRecording) {
-      if (takeLong(btnLeft)) { macroRecording = false; currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return; }
+      if (takeLong(btnLeft)) { macroRecording = false; setIrNavigationOnRelease(false); currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return; }
       if (takeShort(btnLeft) && irKeyIdx > 0) { irKeyIdx--; drawIrKeys(); return; }
       if (takeShort(btnRight) && irKeyIdx < keyCount - 1) { irKeyIdx++; drawIrKeys(); return; }
+      if (takeLong(btnRight)) { suppressLong(btnRight); return; }
       if (takeShort(btnSelect)) {
         Macro &m = macros[macroSelIdx];
         if (m.nSteps < MAX_STEPS) { m.steps[m.nSteps].isTv = irKeyIsTv ? 1 : 0; m.steps[m.nSteps].devIdx = irKeyDevice; m.steps[m.nSteps].keyIdx = irKeyIdx; m.nSteps++; saveMacros(); }
-        macroRecording = false; currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return;
+        macroRecording = false; setIrNavigationOnRelease(false); currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return;
       }
       return;
     }
-    if (takeLong(btnLeft)) { if (irKeyIsTv) { currentScreen = SCR_IR_TV; drawIrTv(); } else { currentScreen = SCR_IR_POWER; drawIrProj(); } return; }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft)) { setIrNavigationOnRelease(false); if (irKeyIsTv) { currentScreen = SCR_IR_TV; drawIrTv(); } else { currentScreen = SCR_IR_POWER; drawIrProj(); } return; }
+    if (takeLong(btnSelect)) { setIrNavigationOnRelease(false); currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
     if (takeShort(btnLeft) && irKeyIdx > 0) { irKeyIdx--; drawIrKeys(); return; }
     if (takeShort(btnRight) && irKeyIdx < keyCount - 1) { irKeyIdx++; drawIrKeys(); return; }
+    if (takeLong(btnRight)) {
+      irFavoriteFeedback = dev->keys[irKeyIdx] ? addIrFavorite(irKeyIsTv, irKeyDevice, irKeyIdx) : 4;
+      if (irFavoriteFeedback == 0) irFavoriteFeedback = 3;
+      irFavoriteFeedbackAt = millis();
+      drawIrKeys(); return;
+    }
     if (takeShort(btnSelect)) { sendIR(*dev, irKeyIdx); drawIrKeys(); return; }
     if (irSent && millis() - irSentAt > 800) { irSent = false; drawIrKeys(); }
+    if (irFavoriteFeedback && millis() - irFavoriteFeedbackAt > 1500) { irFavoriteFeedback = 0; drawIrKeys(); }
     return;
   }
   // --- IR AUTO ---
@@ -2985,21 +3290,45 @@ void handleTestScreen() {
     if (takeShort(btnSelect)) { irAutoIdx = 0; irAutoRunning = true; irAutoLast = millis() - 1500; drawIrAuto(); }
     return;
   }
+  // --- IR FAVORITES ---
+  if (currentScreen == SCR_IR_FAVORITES) {
+    if (takeLong(btnSelect)) { setIrNavigationOnRelease(false); currentMenuIdx = 5; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft)) {
+      removeIrFavorite(irFavoriteIdx);
+      drawIrFavorites(); return;
+    }
+    if (takeLong(btnRight)) return;
+    if (takeShort(btnLeft)) { irFavoriteIdx = (irFavoriteIdx + MAX_IR_FAVORITES - 1) % MAX_IR_FAVORITES; drawIrFavorites(); return; }
+    if (takeShort(btnRight)) { irFavoriteIdx = (irFavoriteIdx + 1) % MAX_IR_FAVORITES; drawIrFavorites(); return; }
+    if (takeShort(btnSelect)) {
+      IrFavorite &favorite = irFavorites[irFavoriteIdx];
+      const IrDevice* dev = getIrFavoriteDevice(favorite);
+      if (dev) sendIR(*dev, favorite.keyIdx);
+      drawIrFavorites(); return;
+    }
+    if (irSent && millis() - irSentAt > 800) { irSent = false; drawIrFavorites(); }
+    return;
+  }
   // --- MACRO LIST ---
   if (currentScreen == SCR_TOOLS_MACRO) {
-    if (takeLong(btnLeft)) { currentMenuIdx = 5; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft)) { macroPlaying = false; currentMenuIdx = 5; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnSelect)) { macroPlaying = false; macroEditIdx = 0; currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return; }
+    if (macroPlaying) {
+      if (takeShort(btnSelect)) { macroPlaying = false; drawMacroSel(); return; }
+      stepMacroPlay();
+      return;
+    }
     if (takeShort(btnLeft) && macroSelIdx > 0) { macroSelIdx--; drawMacroSel(); return; }
     if (takeShort(btnRight) && macroSelIdx < MAX_MACROS - 1) { macroSelIdx++; drawMacroSel(); return; }
     if (takeShort(btnSelect) && macros[macroSelIdx].nSteps > 0) { startMacroPlay(macroSelIdx); drawMacroSel(); return; }
-    if (takeLong(btnSelect)) { macroEditIdx = 0; currentScreen = SCR_TOOLS_MACRO_EDIT; drawMacroEdit(); return; }
-    if (macroPlaying) stepMacroPlay();
     return;
   }
   // --- MACRO EDIT ---
   if (currentScreen == SCR_TOOLS_MACRO_EDIT) {
     Macro &m = macros[macroSelIdx];
     int totalRows = m.nSteps + 3;
-    if (takeLong(btnSelect)) { currentScreen = SCR_TOOLS_MACRO; drawMacroSel(); return; }
+    if (macroPlaying && takeShort(btnSelect)) { macroPlaying = false; drawMacroEdit(); return; }
+    if (takeLong(btnSelect)) { macroPlaying = false; currentScreen = SCR_TOOLS_MACRO; drawMacroSel(); return; }
     if (takeShort(btnLeft) && macroEditIdx > 0) { macroEditIdx--; drawMacroEdit(); return; }
     if (takeShort(btnRight) && macroEditIdx < totalRows - 1) { macroEditIdx++; drawMacroEdit(); return; }
     if (takeShort(btnSelect)) {
@@ -3092,6 +3421,15 @@ void handleTestScreen() {
     if (takeLong(btnSelect)) { haltScan(); currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
     if (takeShort(btnSelect)) { if (scanMode == SCAN_ON) haltScan(); else startScan(); drawWifiChannels(); return; }
     if (tickScan()) drawWifiChannels();
+    return;
+  }
+  if (currentScreen == SCR_ANALYZE_SIGNAL) {
+    if (takeLong(btnSelect)) { haltScan(); currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
+    if (takeLong(btnLeft) || takeLong(btnRight)) return;
+    if (takeShort(btnLeft) && wifiApCount > 0) { wifiScrollIdx = (wifiScrollIdx + wifiApCount - 1) % wifiApCount; drawAnalyzeSignal(); return; }
+    if (takeShort(btnRight) && wifiApCount > 0) { wifiScrollIdx = (wifiScrollIdx + 1) % wifiApCount; drawAnalyzeSignal(); return; }
+    if (takeShort(btnSelect)) { exportWifiSurveyCsv(); drawAnalyzeSignal(); return; }
+    if (tickScan()) drawAnalyzeSignal();
     return;
   }
   if (currentScreen == SCR_ANALYZE_HIDDEN || currentScreen == SCR_ANALYZE_TWINS) {
@@ -3278,7 +3616,7 @@ void setup() {
   irSend.begin();
   randomSeed(esp_random());
   WiFi.mode(WIFI_OFF); WiFi.persistent(false);
-  loadCreds(); loadBattCal(); loadMap(); loadMacros(); loadHighScores();
+  loadCreds(); loadBattCal(); loadMap(); loadMacros(); loadIrFavorites(); loadHighScores();
   analogReadResolution(12);
   battFirstDone = false;
   lastBattSample = millis();
@@ -3289,7 +3627,7 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
   display.setCursor(16, 16); display.print("TRICORDER");
-  display.setTextSize(1); display.setCursor(16, 38); display.print("v24.0 ready");
+  display.setTextSize(1); display.setCursor(16, 38); display.print("v25.0 ready");
   display.display();
   delay(1500);
   drawBootMsg("Init FAT...");
@@ -3300,9 +3638,34 @@ void setup() {
 }
 void loop() {
   pollButton(btnLeft); pollButton(btnRight); pollButton(btnSelect);
+  if (displaySleeping) {
+    updateBattery();
+    updateClock();
+    tickNtp();
+    if (anyBtnEvent()) {
+      display.ssd1306_command(SSD1306_DISPLAYON);
+      displaySleeping = false;
+      lastBtnEventMs = millis();
+      suppressAll();
+      drawCurrentMenu();
+    } else delay(20);
+    return;
+  }
   updateBattery();
   updateClock();
   tickNtp();
+  static int lastMenuBatteryPct = -999;
+  if (currentScreen == SCR_MENU && !animating && lastMenuBatteryPct != battPct) {
+    lastMenuBatteryPct = battPct;
+    drawCurrentMenu();
+  }
+  uint32_t sleepAfter = (battValid && battPct <= 10) ? 30000UL : DISPLAY_SLEEP_MS;
+  if (currentScreen == SCR_MENU && !animating && millis() - lastBtnEventMs >= sleepAfter) {
+    display.ssd1306_command(SSD1306_DISPLAYOFF);
+    displaySleeping = true;
+    delay(20);
+    return;
+  }
   if (animating) {
     if (!anyBtnEvent()) {
       animOffset += ANIM_STEP;
