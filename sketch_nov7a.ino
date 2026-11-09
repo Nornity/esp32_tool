@@ -1,14 +1,16 @@
 // ============================================================
-// TRICORDER v25.0
+// TRICORDER v25.1
 // v23.1: новая клавиатура 10×4
 // v24.0: Games — Arcade/Logic/Cards/Idle
-// v25.0: atomic battery graph, battery saver, IR favorites, passive WiFi survey
+// v25.0: battery saver, IR favorites, passive WiFi survey
+// v25.1: local tiny-chat AP and safe menu header layout
 //        Tetris, Pong, Flappy, Doodle, Blackjack, BJ Multi, Farm
 // ============================================================
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
+#include <WebServer.h>
 #include <Preferences.h>
 #include <FFat.h>
 #include <time.h>
@@ -40,12 +42,17 @@
 Adafruit_SSD1306 display(SW, SH, &Wire, OLED_RST);
 IRsend irSend(IR_PIN);
 Preferences prefs;
+WebServer chatWeb(80);
+bool chatServerRunning = false;
+bool chatPortalError = false;
+String chatApPassword = "";
 
 struct Btn;
 struct IrDevice;
 struct IrFavorite;
 struct WifiAp;
 struct BJack;
+void haltScan();
 
 enum ScanMode { SCAN_OFF, SCAN_ON };
 ScanMode scanMode = SCAN_OFF;
@@ -546,7 +553,7 @@ void updateBattery() {
   uint32_t readInterval = displaySleeping ? 5000UL : 500UL;
   if (now - lastBattMs < readInterval || now - lastBtnEventMs < 150) return;
   lastBattMs = now;
-  bool radioBusy = (scanMode == SCAN_ON) || (ntpState != NTP_IDLE) ||
+  bool radioBusy = (scanMode == SCAN_ON) || (ntpState != NTP_IDLE) || chatServerRunning ||
                    deauthRunning || cloneRunning || spamRunning || snifferRunning;
   if (radioBusy) { lastRadioActiveMs = now; return; }
   if (lastRadioActiveMs && now - lastRadioActiveMs < 3000) return;
@@ -581,6 +588,141 @@ void drawBatteryIcon(int x, int y) {
     display.drawFastVLine(x + 8, y + 1, 3, SSD1306_WHITE);
     display.drawPixel(x + 8, y + 5, SSD1306_WHITE);
   }
+}
+
+// ---- Offline mini neural-network chat portal ----
+const char chatHtml[] PROGMEM = R"CHATHTML(
+<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tricorder Tiny Chat</title><style>
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101522;color:#e7eefc;font:16px system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}
+main{width:min(680px,100%);height:min(760px,100vh);padding:18px;display:flex;flex-direction:column;gap:12px}h1{font-size:1.2rem;margin:0}small{color:#9eacc5}.log{flex:1;overflow:auto;background:#171f30;border:1px solid #2b3850;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:90%;padding:10px 12px;border-radius:12px;white-space:pre-wrap;line-height:1.4}.bot{align-self:flex-start;background:#25324a}.user{align-self:flex-end;background:#245e73}.row{display:flex;gap:8px}input{min-width:0;flex:1;background:#171f30;color:white;border:1px solid #3b4b67;border-radius:10px;padding:12px;font:inherit}button{border:0;border-radius:10px;padding:0 18px;background:#67d5c3;color:#071a20;font-weight:700;font:inherit}
+</style></head><body><main><h1>Tricorder · Tiny Chat</h1><small>Локальная мини-сеть 8→8→9. Это классификатор тем с короткими ответами, не большая языковая модель и не требует интернета.</small>
+<div id="log" class="log"><div class="msg bot">Привет! Спроси про заряд, время, Wi‑Fi или ИК-пульт.</div></div><form id="form" class="row"><input id="text" maxlength="120" autocomplete="off" placeholder="Напишите сообщение…"><button>Отправить</button></form></main>
+<script>const log=document.querySelector('#log'),input=document.querySelector('#text');function add(t,c){const d=document.createElement('div');d.className='msg '+c;d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight}document.querySelector('#form').addEventListener('submit',async e=>{e.preventDefault();const q=input.value.trim();if(!q)return;input.value='';add(q,'user');try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:q.toLocaleLowerCase()});add(await r.text(),'bot')}catch(_){add('Связь с устройством потеряна. Подключитесь снова к Tricorder-Chat.','bot')}});</script></body></html>
+)CHATHTML";
+
+// Fixed, tiny 8-input -> 8-hidden -> 9-output ReLU network.
+// Inputs are lightweight keyword features; replies are local templates, not generated prose.
+const float chatW1[8][8] = {
+  {1,0,0,0,0,0,0,0},{0,1,0,0,0,0,0,0},{0,0,1,0,0,0,0,0},{0,0,0,1,0,0,0,0},
+  {0,0,0,0,1,0,0,0},{0,0,0,0,0,1,0,0},{0,0,0,0,0,0,1,0},{0,0,0,0,0,0,0,1}
+};
+const float chatW2[9][8] = {
+  {1,0,0,0,0,0,0,0},{0,1,0,0,0,0,0,0},{0,0,1,0,0,0,0,0},{0,0,0,1,0,0,0,0},
+  {0,0,0,0,1,0,0,0},{0,0,0,0,0,1,0,0},{0,0,0,0,0,0,1,0},{0,0,0,0,0,0,0,1},
+  {0,0,0,0,0,0,0,0}
+};
+const float chatHiddenBias[8] = {0,0,0,0,0,0,0,0};
+const float chatOutputBias[9] = {0,0,0,0,0,0,0,0,0.15f};
+
+bool chatHasAny(const String& text, const char* const* words, size_t count) {
+  for (size_t i = 0; i < count; i++) if (text.indexOf(words[i]) >= 0) return true;
+  return false;
+}
+int classifyChatIntent(const String& text) {
+  static const char* greeting[] = {"привет","здравств","добрый","hello","hi"};
+  static const char* battery[] = {"батар","аккум","заряд","battery"};
+  static const char* clock[] = {"время","час","time"};
+  static const char* wifi[] = {"wifi","wi-fi","вайф","сеть"};
+  static const char* infrared[] = {"ик-пульт","ик команд","инфракрас","пульт","телевиз","проектор","ir "};
+  static const char* help[] = {"помощ","умеешь","функци","help"};
+  static const char* joke[] = {"шутк","смешн","анекдот"};
+  static const char* bye[] = {"пока","до свид","bye"};
+  float input[8] = {
+    chatHasAny(text, greeting, sizeof(greeting)/sizeof(greeting[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, battery, sizeof(battery)/sizeof(battery[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, clock, sizeof(clock)/sizeof(clock[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, wifi, sizeof(wifi)/sizeof(wifi[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, infrared, sizeof(infrared)/sizeof(infrared[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, help, sizeof(help)/sizeof(help[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, joke, sizeof(joke)/sizeof(joke[0])) ? 1.0f : 0.0f,
+    chatHasAny(text, bye, sizeof(bye)/sizeof(bye[0])) ? 1.0f : 0.0f
+  };
+  float hidden[8];
+  for (int h = 0; h < 8; h++) {
+    float sum = chatHiddenBias[h];
+    for (int i = 0; i < 8; i++) sum += chatW1[h][i] * input[i];
+    hidden[h] = sum > 0 ? sum : 0; // ReLU
+  }
+  int best = 8;
+  float bestScore = chatOutputBias[8];
+  for (int o = 0; o < 8; o++) {
+    float score = chatOutputBias[o];
+    for (int h = 0; h < 8; h++) score += chatW2[o][h] * hidden[h];
+    if (score > bestScore) { bestScore = score; best = o; }
+  }
+  return best;
+}
+String tinyChatReply(const String& text) {
+  switch (classifyChatIntent(text)) {
+    case 0: return "Привет! Я работаю прямо на ESP32 и отвечаю офлайн.";
+    case 1:
+      if (battValid) { String r = "Заряд: "; r += battPct; r += "%, напряжение "; r += String(battVoltage, 2); r += " В."; return r; }
+      return "Пока не вижу корректного измерения батареи. Проверь делитель и калибровку ADC.";
+    case 2:
+      if (ntpSynced) { char t[16]; snprintf(t, sizeof(t), "%02d:%02d", clockHour, clockMin); return String("Текущее время: ") + t + "."; }
+      return "Время ещё не синхронизировано. Запусти Tools → Clock при доступной сохранённой Wi‑Fi сети.";
+    case 3: return "Для пассивного обзора открой WiFi → Analyze → Signal. Там есть история RSSI и экспорт CSV через Serial.";
+    case 4: return "ИК-команды: открой Proj или TV, выбери устройство и кнопку. Удерживай RIGHT, чтобы сохранить команду в избранное.";
+    case 5: return "Я мини-чат: могу подсказать заряд, время, меню Wi‑Fi и управление ИК. Это не LLM — модель выбирает тему и выдаёт короткий шаблонный ответ.";
+    case 6: return "Почему ESP32 не спорит с батареей? Потому что та всегда на последнем проценте.";
+    case 7: return "Пока! Чат остаётся локальным и не отправляет сообщения в интернет.";
+    default: return "Я пока понимаю темы: заряд, время, Wi‑Fi, ИК-пульт, помощь и шутки. Попробуй спросить об одной из них.";
+  }
+}
+void handleChatPage() {
+  chatWeb.send_P(200, "text/html; charset=utf-8", chatHtml);
+}
+void handleChatMessage() {
+  String message = chatWeb.arg("plain");
+  message.trim();
+  if (message.length() == 0) { chatWeb.send(400, "text/plain; charset=utf-8", "Введите сообщение."); return; }
+  if (message.length() > 120) { chatWeb.send(413, "text/plain; charset=utf-8", "Слишком длинное сообщение (максимум 120 символов)."); return; }
+  message.toLowerCase();
+  chatWeb.send(200, "text/plain; charset=utf-8", tinyChatReply(message));
+}
+void configureChatRoutes() {
+  chatWeb.on("/", HTTP_GET, handleChatPage);
+  chatWeb.on("/api/chat", HTTP_POST, handleChatMessage);
+  chatWeb.onNotFound(handleChatPage);
+}
+bool startChatPortal() {
+  if (chatServerRunning) return true;
+  haltScan();
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_AP);
+  IPAddress ip(192, 168, 4, 1);
+  IPAddress mask(255, 255, 255, 0);
+  if (!WiFi.softAPConfig(ip, ip, mask)) { WiFi.mode(WIFI_OFF); return false; }
+  chatApPassword = String((uint32_t)(esp_random() % 90000000UL) + 10000000UL);
+  if (!WiFi.softAP("Tricorder-Chat", chatApPassword.c_str())) { WiFi.mode(WIFI_OFF); return false; }
+  chatWeb.begin();
+  chatServerRunning = true;
+  return true;
+}
+void stopChatPortal() {
+  if (!chatServerRunning) return;
+  chatServerRunning = false;
+  chatWeb.close();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+void drawChatPortal() {
+  display.clearDisplay();
+  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0); display.print("Tiny NN Chat");
+  display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
+  if (chatPortalError) {
+    display.setCursor(2, 24); display.print("Could not start AP");
+    display.setCursor(2, 56); display.print("hM=back");
+  } else {
+    display.setCursor(2, 14); display.print("WiFi Tricorder-Chat");
+    display.setCursor(2, 25); display.print("Pass "); display.print(chatApPassword);
+    display.setCursor(2, 36); display.print("192.168.4.1");
+    display.setCursor(2, 56); display.print("Connect; hM=stop");
+  }
+  display.display();
 }
 
 // ---- Buttons ----
@@ -648,7 +790,7 @@ const char* wifiItems[] = { "Scan","Channels","Analyze","Test","Attacks","Map" }
 const char* analyzeItems[] = { "Hidden","Twins","Signal" };
 const char* testItems[] = { "Ping","Speed" };
 const char* attackItems[] = { "Clone","Spam" };
-const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav" };
+const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav","AI Chat" };
 const char* secItems[] = { "Passwords","Sniffer" };
 // v24.1: плоский Games (10 пунктов)
 const char* gamesItems[] = { "Snake","Pong","Flappy","Doodle","Mines","2048","Simon","Tetris","BJ","Farm" };
@@ -661,7 +803,7 @@ MenuLevel menus[] = {
   { "Analyze",  analyzeItems, 3, 0,  1 },
   { "Test",     testItems,    2, 0,  1 },
   { "Attacks",  attackItems,  2, 0,  1 },
-  { "Tools",    toolsItems,   7, 0,  0 },
+  { "Tools",    toolsItems,   8, 0,  0 },
   { "Security", secItems,     2, 0,  0 },
   { "Games",    gamesItems,   10, 0, 0 },
   { "System",   systemItems,  2, 0,  0 },
@@ -678,7 +820,7 @@ enum Screen {
   SCR_ATTACK_DEAUTH_SEL, SCR_ATTACK_DEAUTH_RUN,
   SCR_ATTACK_CLONE_SEL, SCR_ATTACK_CLONE_RUN, SCR_ATTACK_SPAM_RUN,
   SCR_IR_POWER, SCR_IR_TV, SCR_IR_KEYS, SCR_IR_AUTO, SCR_IR_FAVORITES,
-  SCR_TOOLS_RANDOM, SCR_TOOLS_PASSWORD, SCR_TOOLS_BATTERY, SCR_TOOLS_BATTCAL, SCR_TOOLS_CLOCK,
+  SCR_TOOLS_RANDOM, SCR_TOOLS_PASSWORD, SCR_TOOLS_BATTERY, SCR_TOOLS_BATTCAL, SCR_TOOLS_CLOCK, SCR_TOOLS_CHAT,
   SCR_TOOLS_MACRO, SCR_TOOLS_MACRO_EDIT,
   SCR_MINES, SCR_SNAKE, SCR_2048, SCR_SIMON,
   SCR_TETRIS, SCR_PONG, SCR_FLAPPY, SCR_DOODLE,
@@ -720,8 +862,26 @@ void drawMenuChrome(int activeIdx) {
   MenuLevel &m = menus[currentMenuIdx];
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 0); display.print(m.title);
-  if (ntpSynced) { char b[6]; snprintf(b, sizeof(b), "%02d:%02d", clockHour, clockMin); display.setCursor(SW - 74, 0); display.print(b); }
-  display.setCursor(SW - 34, 0); display.print(m.index + 1); display.print("/"); display.print(m.count);
+
+  char counter[8];
+  snprintf(counter, sizeof(counter), "%d/%d", m.index + 1, m.count);
+  int16_t bx, by; uint16_t bw, bh;
+  display.getTextBounds(counter, 0, 0, &bx, &by, &bw, &bh);
+  int counterX = SW - 14 - 4 - (int)bw;
+  display.setCursor(counterX, 0); display.print(counter);
+
+  if (ntpSynced) {
+    char clockText[6];
+    snprintf(clockText, sizeof(clockText), "%02d:%02d", clockHour, clockMin);
+    int16_t tx, ty; uint16_t tw, th;
+    display.getTextBounds(clockText, 0, 0, &tx, &ty, &tw, &th);
+    int clockX = counterX - 6 - (int)tw;
+    int16_t titleX, titleY; uint16_t titleW, titleH;
+    display.getTextBounds(m.title, 0, 0, &titleX, &titleY, &titleW, &titleH);
+    if (clockX >= 2 + (int)titleW + 4) {
+      display.setCursor(clockX, 0); display.print(clockText);
+    }
+  }
   drawBatteryIcon(SW - 14, 1);
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
   drawArrow(2, 20, false); drawArrow(SW - 10, 20, true);
@@ -2962,6 +3122,7 @@ void enterSelected() {
     if (idx == 4) { currentScreen = SCR_TOOLS_CLOCK; drawToolsClock(); }
     if (idx == 5) { macroSelIdx = 0; currentScreen = SCR_TOOLS_MACRO; drawMacroSel(); }
     if (idx == 6) { irFavoriteIdx = 0; setIrNavigationOnRelease(true); currentScreen = SCR_IR_FAVORITES; drawIrFavorites(); }
+    if (idx == 7) { chatPortalError = !startChatPortal(); currentScreen = SCR_TOOLS_CHAT; drawChatPortal(); }
   }
   else if (currentMenuIdx == 6) {
     if (idx == 0) { pwdListIdx = 0; currentScreen = SCR_PWD_LIST; drawPwdList(); }
@@ -3350,6 +3511,13 @@ void handleTestScreen() {
     return;
   }
   // --- TOOLS ---
+  if (currentScreen == SCR_TOOLS_CHAT) {
+    if (takeLong(btnSelect)) {
+      stopChatPortal();
+      currentMenuIdx = 5; currentScreen = SCR_MENU; drawCurrentMenu(); return;
+    }
+    return;
+  }
   if (currentScreen == SCR_TOOLS_RANDOM) {
     if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
     if (takeShort(btnLeft)) { rndMode = (rndMode + 3) % 4; rndValue = 0; drawToolsRandom(); return; }
@@ -3611,6 +3779,7 @@ void drawBootMsg(const char* msg) {
 }
 void setup() {
   Serial.begin(115200);
+  configureChatRoutes();
   delay(300);
   pinMode(BTN_L, INPUT_PULLUP); pinMode(BTN_R, INPUT_PULLUP); pinMode(BTN_M, INPUT_PULLUP);
   pinMode(IR_PIN, OUTPUT); digitalWrite(IR_PIN, LOW);
@@ -3629,7 +3798,7 @@ void setup() {
   display.clearDisplay();
   display.setTextSize(2); display.setTextColor(SSD1306_WHITE);
   display.setCursor(16, 16); display.print("TRICORDER");
-  display.setTextSize(1); display.setCursor(16, 38); display.print("v25.0 ready");
+  display.setTextSize(1); display.setCursor(16, 38); display.print("v25.1 ready");
   display.display();
   delay(1500);
   drawBootMsg("Init FAT...");
@@ -3640,10 +3809,11 @@ void setup() {
 }
 void loop() {
   pollButton(btnLeft); pollButton(btnRight); pollButton(btnSelect);
+  if (chatServerRunning) chatWeb.handleClient();
   if (displaySleeping) {
     updateBattery();
     updateClock();
-    tickNtp();
+    if (!chatServerRunning) tickNtp();
     if (anyBtnEvent()) {
       display.ssd1306_command(SSD1306_DISPLAYON);
       displaySleeping = false;
@@ -3655,7 +3825,7 @@ void loop() {
   }
   updateBattery();
   updateClock();
-  tickNtp();
+  if (!chatServerRunning) tickNtp();
   static int lastMenuBatteryPct = -999;
   if (currentScreen == SCR_MENU && !animating && lastMenuBatteryPct != battPct) {
     lastMenuBatteryPct = battPct;
