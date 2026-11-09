@@ -71,6 +71,7 @@ uint32_t lastRadioActiveMs = 0;
 // ---- High scores ----
 int hiSnake = 0, hi2048 = 0, hiSimon = 0;
 int hiTetris = 0, hiFlappy = 0, hiDoodle = 0;
+int hiReactor = 0;
 uint32_t hiFarm = 0;
 int hiBJ = 0;
 void loadHighScores() {
@@ -83,6 +84,7 @@ void loadHighScores() {
   hiDoodle = prefs.getInt("doodle", 0);
   hiFarm   = prefs.getUInt("farm", 0);
   hiBJ     = prefs.getInt("bj", 0);
+  hiReactor = prefs.getInt("reactor", 0);
   prefs.end();
 }
 void saveHighScore(const char* key, int val) {
@@ -879,8 +881,8 @@ const char* testItems[] = { "Ping","Speed" };
 const char* attackItems[] = { "Clone","Spam" };
 const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav","AI Chat" };
 const char* secItems[] = { "Passwords","Sniffer" };
-// v24.1: плоский Games (10 пунктов)
-const char* gamesItems[] = { "Snake","Pong","Flappy","Doodle","Mines","2048","Simon","Tetris","BJ","Farm" };
+// v24.1+: плоский Games с авторской головоломкой Reactor
+const char* gamesItems[] = { "Snake","Pong","Flappy","Doodle","Mines","2048","Simon","Tetris","BJ","Farm","Reactor" };
 const char* systemItems[] = { "Info","Space" };
 
 struct MenuLevel { const char* title; const char** items; int count; int index; int parent; };
@@ -892,7 +894,7 @@ MenuLevel menus[] = {
   { "Attacks",  attackItems,  2, 0,  1 },
   { "Tools",    toolsItems,   8, 0,  0 },
   { "Security", secItems,     2, 0,  0 },
-  { "Games",    gamesItems,   10, 0, 0 },
+  { "Games",    gamesItems,   11, 0, 0 },
   { "System",   systemItems,  2, 0,  0 },
 };
 int currentMenuIdx = 0;
@@ -911,7 +913,7 @@ enum Screen {
   SCR_TOOLS_MACRO, SCR_TOOLS_MACRO_EDIT,
   SCR_MINES, SCR_SNAKE, SCR_2048, SCR_SIMON,
   SCR_TETRIS, SCR_PONG, SCR_FLAPPY, SCR_DOODLE,
-  SCR_BJ, SCR_BJM, SCR_FARM,
+  SCR_BJ, SCR_BJM, SCR_FARM, SCR_REACTOR,
   SCR_SNIFFER, SCR_INFO, SCR_SPACE
 };
 Screen currentScreen = SCR_MENU;
@@ -2944,6 +2946,97 @@ void drawFarm() {
 }
 
 // =========================================================
+// Reactor Route: connect the incoming power line to the core output.
+// =========================================================
+#define RX_SIZE 4
+#define RX_CELLS (RX_SIZE * RX_SIZE)
+#define RX_CELL_PX 10
+#define RX_GRID_X 44
+#define RX_GRID_Y 12
+uint8_t reactorTiles[RX_CELLS];
+int reactorCursor = 0, reactorMoves = 0, reactorScore = 0;
+bool reactorSolved = false;
+
+uint8_t reactorRotate(uint8_t mask, int turns) {
+  while (turns-- > 0) mask = (uint8_t)(((mask << 1) & 0x0F) | (mask >> 3));
+  return mask;
+}
+bool reactorHasPowerPath();
+void reactorGenerate() {
+  reactorSolved = false; reactorCursor = 0; reactorMoves = 0;
+  bool onPath[RX_CELLS] = {false};
+  uint8_t solution[RX_CELLS] = {0};
+  uint8_t steps[6] = {1,1,1,2,2,2}; // east and south, shuffled into one guaranteed route
+  for (int i = 5; i > 0; i--) { int j = random(i + 1); uint8_t t = steps[i]; steps[i] = steps[j]; steps[j] = t; }
+  int px[7] = {0}, py[7] = {0};
+  for (int i = 0; i < 6; i++) { px[i+1] = px[i] + (steps[i] == 1); py[i+1] = py[i] + (steps[i] == 2); }
+  for (int k = 0; k < 7; k++) {
+    int incoming = (k == 0) ? 3 : (steps[k-1] + 2) % 4;
+    int outgoing = (k == 6) ? 1 : steps[k];
+    int cell = py[k] * RX_SIZE + px[k];
+    solution[cell] = (uint8_t)((1 << incoming) | (1 << outgoing));
+    onPath[cell] = true;
+  }
+  const uint8_t shapes[] = {0x05, 0x03, 0x07, 0x0F, 0x01};
+  for (int i = 0; i < RX_CELLS; i++) {
+    uint8_t shape = onPath[i] ? solution[i] : shapes[random(5)];
+    reactorTiles[i] = reactorRotate(shape, random(4));
+  }
+  for (int n = 0; n < 4 && reactorHasPowerPath(); n++)
+    reactorTiles[0] = reactorRotate(reactorTiles[0], 1);
+}
+void reactorStartGame() { reactorScore = 0; reactorGenerate(); }
+bool reactorHasPowerPath() {
+  if (!(reactorTiles[0] & 0x08)) return false; // external input enters from west
+  bool seen[RX_CELLS] = {false}; int queue[RX_CELLS], head = 0, tail = 0;
+  queue[tail++] = 0; seen[0] = true;
+  const int dx[4] = {0,1,0,-1}, dy[4] = {-1,0,1,0};
+  while (head < tail) {
+    int cell = queue[head++], x = cell % RX_SIZE, y = cell / RX_SIZE;
+    for (int d = 0; d < 4; d++) {
+      if (!(reactorTiles[cell] & (1 << d))) continue;
+      int nx = x + dx[d], ny = y + dy[d];
+      if (nx < 0 || nx >= RX_SIZE || ny < 0 || ny >= RX_SIZE) continue;
+      int next = ny * RX_SIZE + nx, opposite = (d + 2) % 4;
+      if (!(reactorTiles[next] & (1 << opposite))) continue;
+      if (!seen[next]) { seen[next] = true; queue[tail++] = next; }
+    }
+  }
+  return seen[RX_CELLS - 1] && (reactorTiles[RX_CELLS - 1] & 0x02); // core output east
+}
+void drawReactor() {
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 0);
+  if (reactorSolved) display.print("CORE STABLE!");
+  else { display.print("R"); display.print(reactorScore + 1); display.print(" M"); display.print(reactorMoves); }
+  display.setCursor(91, 0); display.print("HI "); display.print(hiReactor);
+  int cy0 = RX_GRID_Y + RX_CELL_PX / 2;
+  display.drawLine(RX_GRID_X - 4, cy0, RX_GRID_X, cy0, SSD1306_WHITE);
+  display.setCursor(26, cy0 - 3); display.print("IN");
+  int outY = RX_GRID_Y + 3 * RX_CELL_PX + RX_CELL_PX/2;
+  display.drawLine(RX_GRID_X + RX_SIZE * RX_CELL_PX, outY,
+                   RX_GRID_X + RX_SIZE * RX_CELL_PX + 4, outY, SSD1306_WHITE);
+  display.setCursor(91, outY - 3); display.print("OUT");
+  for (int cell = 0; cell < RX_CELLS; cell++) {
+    int x = RX_GRID_X + (cell % RX_SIZE) * RX_CELL_PX;
+    int y = RX_GRID_Y + (cell / RX_SIZE) * RX_CELL_PX;
+    bool selected = cell == reactorCursor;
+    if (selected) display.fillRect(x, y, RX_CELL_PX, RX_CELL_PX, SSD1306_WHITE);
+    uint16_t ink = selected ? SSD1306_BLACK : SSD1306_WHITE;
+    display.drawRect(x, y, RX_CELL_PX, RX_CELL_PX, ink);
+    int cx = x + RX_CELL_PX/2, cy = y + RX_CELL_PX/2;
+    if (reactorTiles[cell] & 0x01) display.drawLine(cx, cy, cx, y + 1, ink);
+    if (reactorTiles[cell] & 0x02) display.drawLine(cx, cy, x + RX_CELL_PX - 2, cy, ink);
+    if (reactorTiles[cell] & 0x04) display.drawLine(cx, cy, cx, y + RX_CELL_PX - 2, ink);
+    if (reactorTiles[cell] & 0x08) display.drawLine(cx, cy, x + 1, cy, ink);
+    display.drawPixel(cx, cy, ink);
+  }
+  display.setCursor(2, 56);
+  display.print(reactorSolved ? "M=next hM=exit" : "L/R=cell M=turn");
+  display.display();
+}
+
+// =========================================================
 // Sniffer
 // =========================================================
 volatile uint32_t sniffBeacon = 0, sniffProbe = 0, sniffData = 0, sniffMgmt = 0, sniffCtrl = 0, sniffDeauth = 0;
@@ -3215,7 +3308,7 @@ void enterSelected() {
     if (idx == 0) { pwdListIdx = 0; currentScreen = SCR_PWD_LIST; drawPwdList(); }
     if (idx == 1) { currentScreen = SCR_SNIFFER; startSniffer(); }
   }
-  // v24.1: Games плоский (10 пунктов)
+  // Games: плоское меню, включая головоломку Reactor
   else if (currentMenuIdx == 7) {
     btnLeft.fireOnPress = false; btnRight.fireOnPress = false;
     if (idx == 0) { snInit(); currentScreen = SCR_SNAKE; drawSnake(); }
@@ -3228,6 +3321,7 @@ void enterSelected() {
     if (idx == 7) { tInit(); currentScreen = SCR_TETRIS; drawTetris(); }
     if (idx == 8) { bjInit(1); currentScreen = SCR_BJ; drawBJ(); }
     if (idx == 9) { if (!farmStarted) farmInit(); currentScreen = SCR_FARM; drawFarm(); }
+    if (idx == 10) { reactorStartGame(); currentScreen = SCR_REACTOR; drawReactor(); }
   }
   else if (currentMenuIdx == 8) {
     if (idx == 0) { currentScreen = SCR_INFO; drawInfo(); }
@@ -3363,6 +3457,29 @@ void handleTestScreen() {
     }
     if (takeShort(btnLeft))  { bjHit(0); bjFinish(); drawBJ(); return; }
     if (takeShort(btnRight)) { bjStand(0); bjFinish(); drawBJ(); return; }
+    return;
+  }
+  // --- REACTOR ROUTE ---
+  if (currentScreen == SCR_REACTOR) {
+    if (takeLong(btnSelect)) {
+      btnLeft.fireOnPress = true; btnRight.fireOnPress = true;
+      currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return;
+    }
+    if (reactorSolved) {
+      if (takeShort(btnSelect)) { reactorScore++; reactorGenerate(); drawReactor(); }
+      return;
+    }
+    if (takeShort(btnLeft)) { reactorCursor = (reactorCursor + RX_CELLS - 1) % RX_CELLS; drawReactor(); return; }
+    if (takeShort(btnRight)) { reactorCursor = (reactorCursor + 1) % RX_CELLS; drawReactor(); return; }
+    if (takeShort(btnSelect)) {
+      reactorTiles[reactorCursor] = reactorRotate(reactorTiles[reactorCursor], 1);
+      reactorMoves++;
+      if (reactorHasPowerPath()) {
+        reactorSolved = true;
+        if (reactorScore + 1 > hiReactor) { hiReactor = reactorScore + 1; saveHighScore("reactor", hiReactor); }
+      }
+      drawReactor(); return;
+    }
     return;
   }
   // --- FARM ---
