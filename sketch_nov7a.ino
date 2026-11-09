@@ -16,10 +16,12 @@
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
+#include "tiny_chat_intent.h"
 #include "tiny_chat_model.h"
 
 #define HAVE_QR 1
@@ -595,18 +597,15 @@ void drawBatteryIcon(int x, int y) {
 // ---- Offline mini neural-network chat portal ----
 const char chatHtml[] PROGMEM = R"CHATHTML(
 <!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Tricorder Offline Chat</title><style>
+<title>Tricorder Tiny RNN</title><style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101522;color:#e7eefc;font:16px system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}
 main{width:min(680px,100%);height:min(760px,100vh);padding:18px;display:flex;flex-direction:column;gap:12px}h1{font-size:1.2rem;margin:0}small{color:#9eacc5}.log{flex:1;overflow:auto;background:#171f30;border:1px solid #2b3850;border-radius:14px;padding:12px;display:flex;flex-direction:column;gap:10px}
 .msg{max-width:90%;padding:10px 12px;border-radius:12px;white-space:pre-wrap;line-height:1.4}.bot{align-self:flex-start;background:#25324a}.user{align-self:flex-end;background:#245e73}.row{display:flex;gap:8px}input{min-width:0;flex:1;background:#171f30;color:white;border:1px solid #3b4b67;border-radius:10px;padding:12px;font:inherit}button{border:0;border-radius:10px;padding:0 18px;background:#67d5c3;color:#071a20;font-weight:700;font:inherit}
-</style></head><body><main><h1>Tricorder · Tiny Chat</h1><small>Офлайн-классификатор 1024→192→96→17 с квантованными int8-весами (~212 КиБ). Выбирает тему и готовый ответ; это не LLM и не генерирует свободный текст.</small>
-<div id="log" class="log"><div class="msg bot">Привет! Спроси про заряд, время, Wi‑Fi или ИК-пульт.</div></div><form id="form" class="row"><input id="text" maxlength="120" autocomplete="off" placeholder="Напишите сообщение…"><button>Отправить</button></form></main>
+</style></head><body><main><h1>Tricorder · Tiny Chat</h1><small>Офлайн-гибрид: маленький классификатор задаёт тему, а посимвольная RNN генерирует ответ. Это эксперимент, не полноценная LLM; ответы ограничены обучающими примерами.</small>
+<div id="log" class="log"><div class="msg bot">Привет! Я генерирую ответы офлайн на маленькой RNN. Могу ошибаться.</div></div><form id="form" class="row"><input id="text" maxlength="120" autocomplete="off" placeholder="Напишите сообщение…"><button>Отправить</button></form></main>
 <script>const log=document.querySelector('#log'),input=document.querySelector('#text');function add(t,c){const d=document.createElement('div');d.className='msg '+c;d.textContent=t;log.append(d);log.scrollTop=log.scrollHeight}document.querySelector('#form').addEventListener('submit',async e=>{e.preventDefault();const q=input.value.trim();if(!q)return;input.value='';add(q,'user');try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'text/plain;charset=utf-8'},body:q.toLocaleLowerCase()});add(await r.text(),'bot')}catch(_){add('Связь с устройством потеряна. Подключитесь снова к Tricorder-Chat.','bot')}});</script></body></html>
 )CHATHTML";
 
-// Offline quantized text classifier. The 1024 hashed word/bigram/byte-trigram features feed
-// a 1024 -> 192 -> 96 -> 17 ReLU MLP (~212 KiB int8 weights); replies are templates,
-// not generated prose. Token/hash logic mirrors train_tiny_chat.py.
 uint32_t chatFnv1a(const uint8_t* bytes, size_t length) {
   uint32_t hash = 2166136261UL;
   for (size_t i = 0; i < length; i++) { hash ^= bytes[i]; hash *= 16777619UL; }
@@ -673,31 +672,91 @@ int classifyChatIntent(const String& text) {
   // Avoid presenting a confident-looking answer for an ambiguous/out-of-domain prompt.
   return (bestScore - secondScore < 0.12f) ? -1 : best;
 }
-String tinyChatReply(const String& text) {
-  switch (classifyChatIntent(text)) {
-    case 0: return "Привет! Я работаю прямо на ESP32 и отвечаю офлайн.";
-    case 1:
-      if (battValid) { String r = "Заряд: "; r += battPct; r += "%, напряжение "; r += String(battVoltage, 2); r += " В."; return r; }
-      return "Пока не вижу корректного измерения батареи. Проверь делитель и калибровку ADC.";
-    case 2:
-      if (ntpSynced) { char t[16]; snprintf(t, sizeof(t), "%02d:%02d", clockHour, clockMin); return String("Текущее время: ") + t + "."; }
-      return "Время ещё не синхронизировано. Запусти Tools → Clock при доступной сохранённой Wi‑Fi сети.";
-    case 3: return "Для пассивного обзора открой WiFi → Analyze → Signal. Там есть история RSSI и экспорт CSV через Serial.";
-    case 4: return "В WiFi → Channels показана оценка загруженности 2.4 ГГц по видимым точкам доступа; это не измерение airtime.";
-    case 5: return "ИК-команды: открой Proj или TV, выбери устройство и кнопку. Удерживай RIGHT, чтобы сохранить команду в избранное.";
-    case 6: return "Открой Games в главном меню: доступны Snake, Tetris, Pong, Flappy, Doodle и другие мини-игры.";
-    case 7: return "OLED гаснет после бездействия для экономии батареи; нажми любую кнопку, чтобы разбудить экран.";
-    case 8: return "Это Tricorder на ESP32-C3: OLED, кнопки, Wi-Fi для локальных функций и ИК-передатчик.";
-    case 9: return "Устройство поддерживает отдельные диагностические сетевые функции. Они не запускаются из чата; используй их только в своей сети.";
-    case 10: return "ИК-макросы находятся в Tools → Macro. Для ИК-избранного открой Tools → IR Fav.";
-    case 11: return "Сохранёнными Wi-Fi сетями можно управлять в разделе WiFi. Чат не показывает и не раскрывает пароли.";
-    case 12: return "Спроси про заряд, время, Wi-Fi, каналы, ИК, игры, энергосбережение или меню. Я выбираю тему, а не генерирую свободный текст.";
-    case 13: return "Пожалуйста! Чат работает локально на устройстве.";
-    case 14: return "Почему ESP32 не спорит с батареей? Потому что та всегда на последнем проценте.";
-    case 15: return "Пока! Чат остаётся локальным и не отправляет сообщения в интернет.";
-    case 16: return "Это вне моих тем. Я могу подсказать про заряд, время, Wi-Fi, каналы, ИК, игры и функции устройства.";
-    default: return "Пока не понял. Я распознаю ограниченный набор тем: заряд, время, Wi-Fi, ИК, игры и функции устройства.";
+
+// A compact intent router supplies a topic tag to a prompt-conditioned character RNN.
+// The 96-state RNN predicts one Unicode character at a time; replies are not looked up.
+// This hybrid is an experimental generator, not a capable general-purpose LLM.
+int chatCharId(uint32_t cp) {
+  for (int i = 0; i < CHAT_VOCAB; i++) if (chatChars[i] == cp) return i;
+  for (int i = 0; i < CHAT_VOCAB; i++) if (chatChars[i] == '?') return i;
+  return 0;
+}
+uint32_t chatReadCodepoint(const uint8_t* bytes, size_t length, size_t& pos) {
+  if (pos >= length) return 0;
+  uint8_t a = bytes[pos++];
+  if (a < 0x80) return a;
+  if ((a & 0xE0) == 0xC0 && pos < length) return ((uint32_t)(a & 0x1F) << 6) | (bytes[pos++] & 0x3F);
+  if ((a & 0xF0) == 0xE0 && pos + 1 < length) {
+    uint8_t b = bytes[pos++], c = bytes[pos++];
+    return ((uint32_t)(a & 0x0F) << 12) | ((uint32_t)(b & 0x3F) << 6) | (c & 0x3F);
   }
+  if ((a & 0xF8) == 0xF0 && pos + 2 < length) { pos += 3; return '?'; }
+  return '?';
+}
+uint32_t chatLowerCodepoint(uint32_t cp) {
+  if (cp >= 'A' && cp <= 'Z') return cp + 32;
+  if (cp >= 0x0410 && cp <= 0x042F) return cp + 0x20;
+  if (cp == 0x0401) return 0x0451;
+  return cp;
+}
+void chatRnnStep(int inputId, float* state, float* logits) {
+  float next[CHAT_HIDDEN];
+  for (int h = 0; h < CHAT_HIDDEN; h++) {
+    float sum = chatBh[h] + (float)chatWxhQ[inputId * CHAT_HIDDEN + h] * chatScaleX;
+    for (int j = 0; j < CHAT_HIDDEN; j++)
+      sum += state[j] * (float)chatWhhQ[j * CHAT_HIDDEN + h] * chatScaleH;
+    next[h] = tanhf(sum);
+  }
+  memcpy(state, next, sizeof(next));
+  for (int o = 0; o < CHAT_VOCAB; o++) {
+    float sum = chatBy[o];
+    for (int h = 0; h < CHAT_HIDDEN; h++)
+      sum += state[h] * (float)chatWhyQ[h * CHAT_VOCAB + o] * chatScaleY;
+    logits[o] = sum;
+  }
+}
+void chatFeedText(const char* text, float* state, float* logits) {
+  const uint8_t* bytes = (const uint8_t*)text; size_t length = strlen(text), pos = 0;
+  while (pos < length) chatRnnStep(chatCharId(chatReadCodepoint(bytes, length, pos)), state, logits);
+}
+void chatAppendCodepoint(String& out, uint32_t cp) {
+  if (cp < 0x80) out += (char)cp;
+  else if (cp < 0x800) { out += (char)(0xC0 | (cp >> 6)); out += (char)(0x80 | (cp & 0x3F)); }
+  else { out += (char)(0xE0 | (cp >> 12)); out += (char)(0x80 | ((cp >> 6) & 0x3F)); out += (char)(0x80 | (cp & 0x3F)); }
+}
+uint32_t chatSampleChar(const float* logits) {
+  int best = 0;
+  for (int i = 1; i < CHAT_VOCAB; i++) if (logits[i] > logits[best]) best = i;
+  return chatChars[best]; // greedy decoding avoids garbled output on this tiny training set
+}
+const char* const chatClassTags[CHAT_CLASSES] = {
+  "приветствие", "батарея", "время", "обзор_wifi", "каналы_wifi", "ик", "игры",
+  "энергосбережение", "устройство", "диагностика_сети", "макрос", "сохраненные_сети",
+  "помощь", "благодарность", "шутка", "прощание", "вне_тем"
+};
+String tinyChatReply(const String& text) {
+  float state[CHAT_HIDDEN] = {0}; float logits[CHAT_VOCAB];
+  chatFeedText("Вопрос: ", state, logits);
+  const uint8_t* bytes = (const uint8_t*)text.c_str(); size_t length = text.length(), pos = 0;
+  while (pos < length) {
+    uint32_t cp = chatLowerCodepoint(chatReadCodepoint(bytes, length, pos));
+    chatRnnStep(chatCharId(cp), state, logits);
+  }
+  int topic = classifyChatIntent(text);
+  if (topic < 0 || topic >= CHAT_CLASSES) topic = CHAT_CLASSES - 1;
+  chatFeedText("\nТема: ", state, logits);
+  chatFeedText(chatClassTags[topic], state, logits);
+  chatFeedText("\nОтвет: ", state, logits);
+  String answer;
+  for (int i = 0; i < 180; i++) {
+    uint32_t cp = chatSampleChar(logits);
+    if (cp == '\n' || cp == '\r') break;
+    chatAppendCodepoint(answer, cp);
+    chatRnnStep(chatCharId(cp), state, logits);
+  }
+  answer.trim();
+  if (answer.length() == 0) return "Я не смог сформировать ответ. Попробуй спросить о функциях устройства.";
+  return answer;
 }
 void handleChatPage() {
   chatWeb.send_P(200, "text/html; charset=utf-8", chatHtml);
@@ -739,7 +798,7 @@ void stopChatPortal() {
 void drawChatPortal() {
   display.clearDisplay();
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0); display.print("Tiny NN Chat");
+  display.setCursor(2, 0); display.print("Tiny RNN Chat");
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
   if (chatPortalError) {
     display.setCursor(2, 24); display.print("Could not start AP");

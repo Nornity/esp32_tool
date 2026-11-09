@@ -1,194 +1,182 @@
 #!/usr/bin/env python3
-"""Train/export the compact offline Tricorder chat intent model. Host-only NumPy dependency."""
+"""Train a tiny prompt-conditioned character RNN for the ESP32-C3 chat."""
 from __future__ import annotations
 
-import re
 from pathlib import Path
 import numpy as np
+from chat_corpus import DATA
 
-FEATURES = 1024
-H1, H2, CLASSES = 192, 96, 17
+HIDDEN = 96
+EPOCHS = 120
+BATCH = 64
+SEED = 20261109
 OUT = Path(__file__).with_name("tiny_chat_model.h")
+CLASS_TAGS = ["приветствие", "батарея", "время", "обзор_wifi", "каналы_wifi", "ик", "игры", "энергосбережение", "устройство", "диагностика_сети", "макрос", "сохраненные_сети", "помощь", "благодарность", "шутка", "прощание", "вне_тем"]
 
-# Short, varied Russian/English utterances. Runtime replies remain local templates.
-DATA = {
-    0: "привет|здравствуйте|доброе утро|добрый вечер|хай|hello|hi|как дела|привет трикодер|рад тебя видеть|начнем разговор|ку|добрый день|эй привет|привет дружище|что нового|здравствуй помощник|добрый день устройство|можно вопрос|поговорим",
-    1: "сколько заряда|покажи батарею|состояние аккумулятора|уровень батареи|сколько процентов осталось|проверь заряд|напряжение аккумулятора|battery status|battery level|сколько вольт на батарее|моя батарея|заряд устройства|акб разряжен|информация о батарее|покажи процент заряда|сколько энергии осталось|как заряжен аккумулятор|напряжение питания|батарейка|battery",
-    2: "который час|скажи время|покажи часы|сколько сейчас времени|текущее время|what time is it|clock status|время сейчас|узнать время|часы устройства|покажи текущее время|есть точное время|время синхронизировано|сколько времени|синхронизируй часы|время на часах|текущий час|time now|время|часы",
-    3: "найди wifi сети|сканировать вайфай|покажи сети вокруг|сделай скан wifi|уровень сигнала сети|покажи список точек доступа|wifi scan|посмотреть rssi|анализ беспроводной сети|найти точки доступа|сигнал роутера|история сигнала wifi|пассивный анализ эфира|сделай обзор сетей|какие сети рядом|где посмотреть вай фай|проведи сканирование сетей|уровень rssi|сигнал wi fi|сети вокруг меня",
-    4: "какой канал выбрать|покажи загруженность каналов|лучший wifi канал|помехи на канале|wifi channels|загруженность диапазона|какие каналы свободны|оценка каналов 2.4|проверь канал роутера|график каналов wifi|выбери канал один шесть одиннадцать|уровень помех wifi|сравни каналы|канал для точки доступа|соседние wifi каналы|покажи каналы|где меньше сетей|оценить загруженность эфира|частота вайфая|каналы",
-    5: "как отправить ик команду|пульт телевизора|управление проектором|инфракрасный светодиод|добавить ик команду|сохранить кнопку пульта|ir remote|как пользоваться пультом|переключить телевизор|послать команду телевизору|ик избранное|пульт управления|управляй проектором|отправь power|сохранить кнопку в избранное|инфракрасный пульт|как управлять tv|где команды ir|выбрать телевизор|ик команды|врубить телек|выключи телевизор пультом|нажми кнопку на телеке|отправь ик на телевизор|включить тв через ик|управляй телевизором", 
-    6: "запусти игру|какие есть игры|поиграть в змейку|открой тетрис|игры на устройстве|игра 2048|хочу поиграть|покажи игры|старт pong|запустить mines|есть ли snake|мини игры|игровое меню|начать флаппи|дудл игра|игра блэкджек|открыть farm|игра симон|развлечения|играть",
-    7: "включи энергосбережение|как экономить батарею|почему гаснет экран|режим сна дисплея|отключить oled|автовыключение экрана|power saving|бережный режим|снизить расход энергии|режим батареи|экран выключается|как разбудить экран|порог батареи|экономный режим|дисплей гаснет автоматически|через сколько экран отключится|экономия заряда|питание устройства|низкий заряд|энергия|не выключай экран долго|как не дать экрану погаснуть|оставь дисплей включенным|не гаси oled|хочу чтобы экран не отключался|экран погас что делать|включить дисплей обратно|разбудить экран кнопкой|дисплей выключился|экран спит|экран выключается быстро|как отключить таймер oled|подсветка экрана выключилась", 
-    8: "что это за устройство|расскажи о трикодере|версия прошивки|какая версия|информация о проекте|что умеет esp32|about device|характеристики устройства|кто ты|ты робот|версия tricorder|какой микроконтроллер|модель платы|что внутри|покажи информацию|описание устройства|зачем это нужно|что за программа|инфо|about",
-    9: "проверь скорость интернета|запусти ping|сделай тест скорости|измерить задержку|пинг до сервера|internet speed|скорость сети|проверка соединения|тест интернета|сколько миллисекунд ping|speed test|проверь интернет|сеть работает|сделай сетевой тест|измерь скорость wifi|задержка подключения|проверить dns|запустить проверку связи|тест ping|скорость|сделай проверку сети|проверить сетевое соединение|измерь ping", 
-    10: "запусти макрос|повтори макрос|остановить макрос|запись ик макроса|создать последовательность команд|macro play|воспроизведение макроса|как остановить макрос|добавить шаг макроса|список макросов|отправь все команды|повторить последовательность|макрос пульта|запуск сохраненного макроса|редактировать макрос|макро команда|macro|макросы|повтори последовательность|проиграй макрос",
-    11: "покажи сохраненные пароли|список wifi паролей|управление сохраненными сетями|удалить сеть|добавить wifi пароль|забыть сеть|пароли wifi|сохраненные сети|как добавить пароль|список сетей|удали сохраненный пароль|credentials|посмотреть ssid|управлять паролями|сеть и пароль|сохранить wifi|покажи учетные данные|удалить сохраненную точку|пароль сети|база паролей",
-    12: "что ты умеешь|помоги мне|как пользоваться меню|покажи помощь|какие функции есть|help me|инструкция|как работать с устройством|что можно спросить|команды помощи|расскажи возможности|подскажи раздел меню|список функций|помощь по меню|как начать|как это работает|подскажи|help|помощь|функции",
-    13: "спасибо|благодарю|спасибо большое|thanks|молодец|классная работа|ты помог|отлично спасибо|большое спасибо|понятно благодарю|супер|хорошо получилось|принято спасибо|спасибо помощник|круто|ценю помощь|мерси|все ясно|благодарность|отлично",
-    14: "расскажи шутку|пошути|анекдот|скажи что нибудь смешное|хочу посмеяться|joke|развесели меня|смешная история|есть шутка|рассмеши|расскажи прикол|шутка про esp32|юмор|скажи анекдот|пошути про батарею|подними настроение|что смешного|смешно|прикол|шутки",
-    15: "пока|до свидания|увидимся|bye|спокойной ночи|я пошел|завершить разговор|до встречи|всего хорошего|прощай|отключаюсь|пока помощник|до скорого|на сегодня хватит|закончим чат|отбой|выход|прощание|пока чат|goodbye",
-    16: "какая сегодня погода|расскажи новости|кто выиграл матч|напиши сочинение|переведи это на английский|как сварить суп|рецепт пирога|реши уравнение|почему небо голубое|столица франции|посоветуй фильм|какая цена биткоина|покажи курс доллара|расскажи про динозавров|что почитать вечером|составь план тренировок|как лечить простуду|найди песню|напиши код на python|история второй мировой|сколько будет два плюс два|как посадить помидоры|расскажи анекдот про кошку|когда следующий поезд|придумай стихотворение|почему идет дождь|что приготовить на ужин|кто такой пушкин|расскажи про космос|найди адрес магазина|как настроить телефон|посоветуй подарок|прогноз погоды на завтра",
+# The network learns to continue a prompt/answer stream; these are training targets,
+# not a runtime lookup table. Text is generated one Unicode character at a time.
+ANSWERS = {
+    0: "Привет! Я работаю прямо на ESP32 и отвечаю локально.",
+    1: "Проверь заряд батареи в меню Tools → Battery. Я могу отвечать только по тем данным, которые реально доступны устройству.",
+    2: "Время можно посмотреть в Tools → Clock. Для точной синхронизации нужны сохранённая Wi-Fi сеть и доступ к интернету.",
+    3: "Для пассивного обзора сетей открой WiFi → Analyze → Signal. Там видны сети и уровень RSSI.",
+    4: "В WiFi → Channels есть оценка загруженности каналов 2.4 ГГц по видимым точкам доступа.",
+    5: "ИК-команда отправляется из Proj или TV. Выбери устройство и кнопку пульта.",
+    6: "Открой Games в главном меню: там есть несколько мини-игр для устройства.",
+    7: "Экран выключается после бездействия для экономии батареи. Нажми любую кнопку, чтобы разбудить его.",
+    8: "Это Tricorder на ESP32-C3 с OLED, кнопками, Wi-Fi и ИК-передатчиком.",
+    9: "Сетевые тесты запускаются отдельно и требуют разрешённой сети. Чат сам их не выполняет.",
+    10: "ИК-макросы находятся в Tools → Macro. Избранные команды — в Tools → IR Fav.",
+    11: "Сохранёнными Wi-Fi сетями управляй в меню WiFi. Я не раскрываю сохранённые пароли.",
+    12: "Я могу рассказать о зарядке, времени, Wi-Fi, каналах, ИК, играх и меню устройства.",
+    13: "Пожалуйста! Рад, что смог помочь.",
+    14: "Почему ESP32 не спорит с батареей? Потому что та всегда на последнем проценте!",
+    15: "Пока! Чат работает локально на устройстве.",
+    16: "Я пока не умею отвечать на такие вопросы. Мои знания ограничены функциями Tricorder.",
 }
 
-# Extra colloquial and paraphrased utterances reduce dependence on the original seed phrases.
-EXTRA = {
-    0: "здарова|приветик|ну привет|доброе|хеллоу|как поживаешь|есть кто|ты здесь|здравствуй трикодер|добрый вечер трикодер|привет ты тут|эй трикодер|салют|здорово|доброе утречко|привет как ты|рад встрече|ку трикодер|хай всем|алло привет",
-    1: "сколько процентов батарейки|аккум сколько живой|покажи остаток заряда|у меня сел аккумулятор|зарядка почти закончилась|battery percentage|сколько осталось питания|проверь батарейку|какой заряд сейчас|состояние батарейки|ну как там мой аккум|как там аккумулятор|чё с зарядом|сколько осталось процентов|аккум в порядке|узнай заряд аккумулятора|сколько жив аккумулятор|посмотри заряд батарейки|как заряжен мой гаджет|аккумулятор сколько процентов", 
-    2: "время на устройстве|можно узнать время|сколько на часах|покажи время сейчас|который сейчас час|what is the time|посмотреть часы|часы показывают сколько|время на дисплее|узнай время|устройства показывают 09 42|часы устройства показывают 9 42|на дисплее 09 42", 
-    3: "найти беспроводные сети|покажи доступные wifi|сколько сетей видно|просканируй эфир|список wifi вокруг|найди роутеры рядом|просмотр сетей поблизости|отобрази найденные сети|сканирование беспроводных точек|покажи уровень сигнала wifi|какие вайфайки видишь|покажи все вайфайки|что ловится по wifi|посмотри какие сети доступны|какие точки сейчас рядом|найди сети вокруг меня",
-    4: "на каком канале меньше помех|какой канал самый свободный|сравнение wifi каналов|подскажи канал для роутера|занятые каналы вокруг|оценка каналов вайфай|канальная обстановка|выбрать канал wifi|помехи на вайфай канале|график занятости каналов|соседи забили частоты на 1 6 11|соседние сети заняли каналы|в каком канале меньше соседей|канал для wi fi роутера|эфир перегружен что делать|проверь свободные частоты wifi",
-    6: "открой список игр|есть тетрис|запусти змейку|хочу сыграть в pong|какие развлечения есть|начать игру на экране|игра на трикодере|поиграть в тетрис|запустить аркаду|игровой раздел",
-    7: "не выключай экран долго|как не дать экрану погаснуть|оставь дисплей включенным|не гаси oled|хочу чтобы экран не отключался|экран погас что делать|включить дисплей обратно|разбудить экран кнопкой|дисплей выключился|экран спит|экран выключается быстро|как отключить таймер oled|подсветка экрана выключилась",
-    5: "включи телевизор|выключи телик|управление тв|пульт от телека|послать команду tv|нажми power на телевизоре|ик передатчик|отправь команду пульта|переключи канал телевизора|телевизор инфракрасная команда|включить проектор пультом|пульт управления телевизором|послать сигнал инфракрасный|управлять тв|команда power tv",
-    8: "какая у меня плата|назови модель микроконтроллера|расскажи что за tricorder|информация о прошивке|на каком чипе работает|ты искусственный интеллект|что за гаджет|описание этой платы|объясни что это|какой у тебя процессор|что за железо внутри|какой здесь esp|модель esp32|информация об устройстве|представься|расскажи кто ты такой|что за esp тут стоит|какой esp здесь установлен|покажи чип устройства|что тут за контроллер", 
-    10: "проиграть ик макрос|как включить макрос|повторить записанную команду|воспроизвести последовательность|записать макрос пульта|управление макросами|макросы ик пульта|повтори команды пульта|запустить сохраненный макрос|остановить воспроизведение макроса",
-    12: "покажи подсказку|список тем чата|на какие темы отвечаешь|что можно спросить у тебя|объясни как пользоваться|покажи команды|нужна инструкция|дай справку|помоги разобраться в меню|подскажи функции устройства|какие вопросы ты понимаешь|расскажи чем можешь помочь|где найти помощь|покажи список возможностей|расскажи как начать пользоваться|помощь по устройству",
-    13: "спасибо тебе|очень благодарен|ты супер|благодарю за помощь|спасибо за ответ|от души спасибо|круто помог|все получилось спасибо|большое тебе спасибо|признателен|спасибо большое тебе|отличная помощь|респект|класс спасибо|вот это помощь|помогло спасибо|спасибки|благодарю тебя|спасибо выручил|прекрасно спасибо|очень помогло|ты молодец спасибо|супер помог спасибо",
 
-    15: "до завтра|прощай чат|я отключаюсь|всё пока|пора идти|давай до встречи|заканчиваю разговор|спокойной ночи трикодер|увидимся позже|на этом всё|до скорого увидимся|я пошел пока|пока всем|закончим на сегодня|выключаю чат|до новых встреч",
-    16: "где купить наушники|поищи информацию о марсе|как поменять обои|сделай перевод фразы|расскажи сказку|сколько километров до москвы|посоветуй сериал|какая температура воды|что такое квантовая физика|напиши поздравление|когда день рождения|как приготовить кофе|какие книги почитать|ответь на вопрос по истории|придумай имя коту|кто создал интернет|какая погода в тамбове|что приготовить на завтрак|сочини песню|почему трава зеленая|сколько стоит новый телефон|расскажи про животных|переведи слово на русский|когда будет лето|как зовут президента|посоветуй хороший ресторан|сколько времени ехать до москвы|напиши стих про осень|как работает двигатель|покажи новости сегодня|найди рецепт борща|кто такой эйнштейн|какие есть фильмы ужасов", 
-}
-for _label, _phrases in EXTRA.items():
-    DATA[_label] += "|" + _phrases
-
-
-def fnv1a(data: bytes) -> int:
-    h = 2166136261
-    for b in data:
-        h = ((h ^ b) * 16777619) & 0xFFFFFFFF
-    return h
-
-
-def features(text: str) -> np.ndarray:
-    raw = text.lower().encode("utf-8")
-    tokens: list[bytearray] = []
-    token = bytearray()
-    for b in raw + b" ":
-        word = b >= 128 or b == 95 or 48 <= b <= 57 or 65 <= b <= 90 or 97 <= b <= 122
-        if word:
-            token.append(b + 32 if 65 <= b <= 90 else b)
-        elif token:
-            tokens.append(token)
-            token = bytearray()
-    x = np.zeros(FEATURES, dtype=np.float32)
-    for index, t in enumerate(tokens):
-        x[fnv1a(bytes(t)) & (FEATURES - 1)] = 1.0
-        for i in range(len(t) - 2):
-            x[fnv1a(t[i:i+3]) & (FEATURES - 1)] = 1.0
-        if index:
-            x[fnv1a(bytes(tokens[index - 1]) + b" " + bytes(t)) & (FEATURES - 1)] = 1.0
-    return x
-
-
-def train() -> tuple[np.ndarray, ...]:
-    # Split original phrases before augmentation; otherwise near-duplicate wrapped
-    # phrases leak into validation and make the reported score misleading.
-    rng = np.random.default_rng(20261109)
-    train_phrases, validation_phrases = [], []
-    for label, packed in DATA.items():
-        phrases = packed.split("|")
-        order = rng.permutation(len(phrases))
-        holdout = max(1, round(len(phrases) * 0.20))
-        validation_phrases.extend((phrases[i], label) for i in order[:holdout])
-        train_phrases.extend((phrases[i], label) for i in order[holdout:])
-
-    examples, labels = [], []
-    for phrase, label in train_phrases:
-        examples.append(features(phrase)); labels.append(label)
-        # Natural wrappers broaden phrasing without contaminating validation.
-        for prefix in ("пожалуйста ", "скажи ", "мне нужно "):
-            examples.append(features(prefix + phrase)); labels.append(label)
-    Xtr = np.asarray(examples, dtype=np.float32)
-    ytr = np.asarray(labels, dtype=np.int64)
-    Xv = np.asarray([features(p) for p, _ in validation_phrases], dtype=np.float32)
-    yv = np.asarray([label for _, label in validation_phrases], dtype=np.int64)
-
-    dims = (FEATURES, H1, H2, CLASSES)
-    weights = [rng.normal(0, np.sqrt(2 / (dims[i] + dims[i+1])), (dims[i], dims[i+1])).astype(np.float32) for i in range(3)]
-    biases = [np.zeros(dims[i+1], dtype=np.float32) for i in range(3)]
-    mw = [np.zeros_like(w) for w in weights]; vw = [np.zeros_like(w) for w in weights]
-    mb = [np.zeros_like(b) for b in biases]; vb = [np.zeros_like(b) for b in biases]
-    step = 0; lr = 0.0015; batch = 64; epochs = 180; decay = 1e-5
-    best_acc = -1.0; best_weights = None; best_epoch = 0
-    for epoch in range(epochs):
-        order = rng.permutation(len(ytr))
-        for start in range(0, len(order), batch):
-            ids = order[start:start+batch]; xb, yb = Xtr[ids], ytr[ids]; n = len(ids)
-            z1 = xb @ weights[0] + biases[0]; a1 = np.maximum(z1, 0)
-            z2 = a1 @ weights[1] + biases[1]; a2 = np.maximum(z2, 0)
-            z3 = a2 @ weights[2] + biases[2]; z3 -= z3.max(axis=1, keepdims=True)
-            probs = np.exp(z3); probs /= probs.sum(axis=1, keepdims=True)
-            probs[np.arange(n), yb] -= 1; probs /= n
-            gw2 = a2.T @ probs + decay * weights[2]; gb2 = probs.sum(axis=0)
-            ga2 = probs @ weights[2].T; gz2 = ga2 * (z2 > 0)
-            gw1 = a1.T @ gz2 + decay * weights[1]; gb1 = gz2.sum(axis=0)
-            ga1 = gz2 @ weights[1].T; gz1 = ga1 * (z1 > 0)
-            gw0 = xb.T @ gz1 + decay * weights[0]; gb0 = gz1.sum(axis=0)
-            gradsW, gradsB = [gw0,gw1,gw2], [gb0,gb1,gb2]
-            step += 1
-            for i in range(3):
-                mw[i] = .9*mw[i] + .1*gradsW[i]; vw[i] = .999*vw[i] + .001*gradsW[i]**2
-                mb[i] = .9*mb[i] + .1*gradsB[i]; vb[i] = .999*vb[i] + .001*gradsB[i]**2
-                mwHat = mw[i] / (1-.9**step); vwHat = vw[i] / (1-.999**step)
-                mbHat = mb[i] / (1-.9**step); vbHat = vb[i] / (1-.999**step)
-                weights[i] -= lr * mwHat / (np.sqrt(vwHat)+1e-8)
-                biases[i] -= lr * mbHat / (np.sqrt(vbHat)+1e-8)
-        if epoch in (0, 9, 19, 39, 59, 79, 119, 179):
-            p = Xv
-            for layer, (w, b) in enumerate(zip(weights, biases)):
-                p = p @ w + b
-                if layer < 2: p = np.maximum(p, 0)
-            acc = float((p.argmax(axis=1) == yv).mean())
-            print(f"epoch {epoch+1:3d}: validation accuracy {acc:.3f}")
-            if acc > best_acc:
-                best_acc, best_epoch = acc, epoch + 1
-                best_weights = ([w.copy() for w in weights], [b.copy() for b in biases])
-    weights, biases = best_weights
-    print(f"selected epoch {best_epoch}: validation accuracy {best_acc:.3f}")
-    return (*weights, *biases, Xv, yv)
-
-
-def qmatrix(w: np.ndarray) -> tuple[np.ndarray, float]:
-    scale = float(np.max(np.abs(w)) / 127.0)
+def fnv_quantize(w: np.ndarray) -> tuple[np.ndarray, float]:
+    scale = max(float(np.max(np.abs(w))) / 127.0, 1e-8)
     return np.clip(np.rint(w / scale), -127, 127).astype(np.int8), scale
 
 
-def c_array(name: str, values: np.ndarray, per_line: int = 24) -> str:
-    flat = values.reshape(-1)
-    lines = [f"const int8_t {name}[{len(flat)}] = {{"]
-    for i in range(0, len(flat), per_line):
-        lines.append("  " + ",".join(str(int(x)) for x in flat[i:i+per_line]) + ",")
-    lines.append("};")
-    return "\n".join(lines)
+def build_examples():
+    rng = np.random.default_rng(SEED)
+    train, valid = [], []
+    for label, packed in DATA.items():
+        phrases = packed.split("|")
+        order = rng.permutation(len(phrases))
+        nval = max(1, round(len(phrases) * .20))
+        for index in order:
+            prompt = phrases[index]
+            prefix = f"Вопрос: {prompt}\nТема: {CLASS_TAGS[label]}\nОтвет: "
+            ids = prefix + ANSWERS[label] + "\n"
+            example = (ids, len(prefix))
+            (valid if index in order[:nval] else train).append(example)
+    return train, valid
 
 
-def f_array(name: str, values: np.ndarray) -> str:
-    body = ",".join(f"{float(x):.8g}f" for x in values)
-    return f"const float {name}[{len(values)}] = {{{body}}};"
+def train_model():
+    rng = np.random.default_rng(SEED)
+    train, valid = build_examples()
+    all_text = "".join(seq for seq, _ in train + valid) + "?"
+    chars = sorted(set(all_text))
+    char_to_id = {c: i for i, c in enumerate(chars)}
+    sequences = []
+    for seq, start in train + valid:
+        sequences.append(([char_to_id[c] for c in seq], start))
+    train_seq, valid_seq = sequences[:len(train)], sequences[len(train):]
+    vocab = len(chars)
+    dimensions = (vocab, HIDDEN, vocab)
+    Wxh = rng.normal(0, np.sqrt(1 / HIDDEN), (vocab, HIDDEN)).astype(np.float32)
+    Whh = rng.normal(0, np.sqrt(1 / HIDDEN), (HIDDEN, HIDDEN)).astype(np.float32)
+    Why = rng.normal(0, np.sqrt(1 / HIDDEN), (HIDDEN, vocab)).astype(np.float32)
+    bh = np.zeros(HIDDEN, np.float32); by = np.zeros(vocab, np.float32)
+    params = [Wxh, Whh, Why, bh, by]
+    m = [np.zeros_like(x) for x in params]; v = [np.zeros_like(x) for x in params]
+    step = 0; best_loss = float("inf"); best = None
+
+    def evaluate(dataset):
+        total_loss = 0.0; total_chars = 0
+        for start in range(0, len(dataset), BATCH):
+            batch = dataset[start:start+BATCH]
+            lens = np.array([len(s)-1 for s, _ in batch], dtype=np.int32)
+            T = int(lens.max())
+            ids = np.zeros((T+1, len(batch)), dtype=np.int32)
+            for j, (seq, _) in enumerate(batch): ids[:len(seq), j] = seq
+            h = np.zeros((len(batch), HIDDEN), np.float32)
+            for t in range(T):
+                active = (t < lens)[:, None]
+                hn = np.tanh(Wxh[ids[t]] + h @ Whh + bh)
+                h = np.where(active, hn, h)
+                logits = h @ Why + by
+                logits -= logits.max(axis=1, keepdims=True)
+                p = np.exp(logits); p /= p.sum(axis=1, keepdims=True)
+                for j, (_, response_start) in enumerate(batch):
+                    if t + 1 >= response_start and t < lens[j]:
+                        total_loss -= float(np.log(max(float(p[j, ids[t+1, j]]), 1e-9)))
+                        total_chars += 1
+        return total_loss / max(total_chars, 1)
+
+    for epoch in range(EPOCHS):
+        order = rng.permutation(len(train_seq))
+        for offset in range(0, len(order), BATCH):
+            batch = [train_seq[i] for i in order[offset:offset+BATCH]]
+            n = len(batch); lens = np.array([len(s)-1 for s, _ in batch], np.int32); T = int(lens.max())
+            ids = np.zeros((T+1, n), np.int32)
+            response_starts = np.array([rs for _, rs in batch], np.int32)
+            for j, (seq, _) in enumerate(batch): ids[:len(seq), j] = seq
+            hs = [np.zeros((n, HIDDEN), np.float32)]
+            probs = []
+            loss_mask = []
+            for t in range(T):
+                active = (t < lens)[:, None]
+                hn = np.tanh(Wxh[ids[t]] + hs[-1] @ Whh + bh)
+                hs.append(np.where(active, hn, hs[-1]))
+                logits = hs[-1] @ Why + by
+                logits -= logits.max(axis=1, keepdims=True)
+                p = np.exp(logits); p /= p.sum(axis=1, keepdims=True)
+                probs.append(p)
+                loss_mask.append(((t + 1 >= response_starts) & (t < lens)).astype(np.float32))
+
+            grads = [np.zeros_like(x) for x in params]
+            dWxh, dWhh, dWhy, dbh, dby = grads
+            dhnext = np.zeros((n, HIDDEN), np.float32)
+            for t in range(T-1, -1, -1):
+                mask = loss_mask[t]
+                dy = probs[t].copy()
+                dy[np.arange(n), ids[t+1]] -= 1.0
+                dy *= mask[:, None] / n
+                dWhy += hs[t+1].T @ dy; dby += dy.sum(axis=0)
+                dh = dy @ Why.T + dhnext
+                da = dh * (1.0 - hs[t+1] * hs[t+1])
+                da *= (t < lens)[:, None]
+                np.add.at(dWxh, ids[t], da)
+                dWhh += hs[t].T @ da; dbh += da.sum(axis=0)
+                dhnext = da @ Whh.T + dh * (1.0 - (t < lens)[:, None])
+            norm = np.sqrt(sum(float(np.sum(g*g)) for g in grads))
+            if norm > 5.0:
+                grads = [g * (5.0 / norm) for g in grads]
+            step += 1
+            lr = 0.0018
+            for k, (param, grad) in enumerate(zip(params, grads)):
+                m[k] = .9*m[k] + .1*grad; v[k] = .999*v[k] + .001*grad*grad
+                mh = m[k]/(1-.9**step); vh = v[k]/(1-.999**step)
+                param -= lr * mh / (np.sqrt(vh) + 1e-8)
+        if epoch % 5 == 0 or epoch == EPOCHS-1:
+            vl = evaluate(valid_seq)
+            print(f"epoch {epoch+1:2d}: held-out response char loss {vl:.3f}")
+            if vl < best_loss:
+                best_loss = vl; best = [x.copy() for x in params]
+    Wxh, Whh, Why, bh, by = best
+    print(f"selected model held-out char loss: {best_loss:.3f}; vocabulary {vocab}, hidden {HIDDEN}")
+    return chars, Wxh, Whh, Why, bh, by
 
 
-def main() -> None:
-    w0,w1,w2,b0,b1,b2,Xv,yv = train()
-    q0,s0=qmatrix(w0); q1,s1=qmatrix(w1); q2,s2=qmatrix(w2)
-    p = np.maximum(Xv @ (q0.reshape(FEATURES,H1).astype(np.float32)*s0) + b0, 0)
-    p = np.maximum(p @ (q1.reshape(H1,H2).astype(np.float32)*s1) + b1, 0)
-    p = p @ (q2.reshape(H2,CLASSES).astype(np.float32)*s2) + b2
-    qpred = p.argmax(axis=1)
-    qacc = float((qpred == yv).mean())
-    margins = np.sort(p, axis=1)[:, -1] - np.sort(p, axis=1)[:, -2]
-    accepted = margins >= 0.12
-    covered = int(accepted.sum())
-    accepted_acc = float((qpred[accepted] == yv[accepted]).mean()) if covered else 0.0
-    print(f"quantized validation accuracy: {qacc:.3f} ({int((qpred == yv).sum())}/{len(yv)}); margin-gated coverage {covered}/{len(yv)}, accuracy {accepted_acc:.3f}")
-    for label in range(CLASSES):
-        mask = yv == label
-        print(f"  class {label:2d}: {(qpred[mask] == yv[mask]).sum()}/{mask.sum()}")
-    text = ["#pragma once", "#include <stdint.h>", f"#define CHAT_FEATURES {FEATURES}", f"#define CHAT_H1 {H1}", f"#define CHAT_H2 {H2}", f"#define CHAT_CLASSES {CLASSES}", 
-            f"const float chatScale1 = {s0:.9g}f;", f"const float chatScale2 = {s1:.9g}f;", f"const float chatScale3 = {s2:.9g}f;",
-            c_array("chatW1Q",q0), c_array("chatW2Q",q1), c_array("chatW3Q",q2), f_array("chatB1",b0), f_array("chatB2",b1), f_array("chatB3",b2)]
-    OUT.write_text("\n\n".join(text)+"\n", encoding="utf-8")
-    print(f"wrote {OUT.name}: {q0.nbytes+q1.nbytes+q2.nbytes:,} quantized weight bytes")
+def array(name: str, x: np.ndarray, typ: str = "int8_t", per_line: int = 24) -> str:
+    flat = x.reshape(-1)
+    rows = [f"const {typ} {name}[{len(flat)}] = {{"]
+    for i in range(0, len(flat), per_line): rows.append("  " + ",".join(str(int(a)) for a in flat[i:i+per_line]) + ",")
+    rows.append("};")
+    return "\n".join(rows)
+
+
+def float_array(name: str, x: np.ndarray) -> str:
+    return f"const float {name}[{len(x)}] = {{" + ",".join(f"{float(a):.8g}f" for a in x) + "};"
+
+
+def main():
+    chars, Wxh, Whh, Why, bh, by = train_model()
+    qx,sx = fnv_quantize(Wxh); qh,sh = fnv_quantize(Whh); qy,sy = fnv_quantize(Why)
+    text = ["#pragma once", "#include <stdint.h>", f"#define CHAT_VOCAB {len(chars)}", f"#define CHAT_HIDDEN {HIDDEN}",
+            f"const float chatScaleX = {sx:.9g}f;", f"const float chatScaleH = {sh:.9g}f;", f"const float chatScaleY = {sy:.9g}f;",
+            array("chatChars", np.array([ord(c) for c in chars], dtype=np.uint16), "uint16_t"),
+            array("chatWxhQ", qx), array("chatWhhQ", qh), array("chatWhyQ", qy),
+            float_array("chatBh", bh), float_array("chatBy", by)]
+    OUT.write_text("\n\n".join(text) + "\n", encoding="utf-8")
+    print(f"wrote {OUT.name}: {(qx.size+qh.size+qy.size):,} quantized weight bytes")
+
 
 if __name__ == "__main__":
     main()
