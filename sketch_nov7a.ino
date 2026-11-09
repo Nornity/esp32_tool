@@ -43,6 +43,8 @@ Preferences prefs;
 
 struct Btn;
 struct IrDevice;
+struct IrFavorite;
+struct WifiAp;
 struct BJack;
 
 enum ScanMode { SCAN_OFF, SCAN_ON };
