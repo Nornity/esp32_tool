@@ -920,17 +920,9 @@ Screen currentScreen = SCR_MENU;
 int testParentMenu = 0;
 int pwdListIdx = 0, pwdDelIdx = 0;
 
-bool animating = false;
-int animOffset = 0, animDir = 0, animPrevIdx = 0, animMenuIdx = 0;
-const int ANIM_STEP = 16;
-
 // =========================================================
 // UI primitives
 // =========================================================
-void drawArrow(int x, int y, bool r) {
-  if (r) display.fillTriangle(x + 8, y, x + 8, y + 12, x, y + 6, SSD1306_WHITE);
-  else display.fillTriangle(x, y, x, y + 12, x + 8, y + 6, SSD1306_WHITE);
-}
 int drawCenteredText(const char* t, int y, int xs, uint8_t sz) {
   display.setTextSize(sz);
   int16_t x1, y1; uint16_t w, h;
@@ -947,7 +939,7 @@ int listStart(int sel, int cnt, int rows) {
   if (ms < 0) ms = 0;
   return s > ms ? ms : s;
 }
-void drawMenuChrome(int activeIdx) {
+void drawMenuChrome() {
   MenuLevel &m = menus[currentMenuIdx];
   display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
   display.setCursor(2, 0); display.print(m.title);
@@ -973,42 +965,36 @@ void drawMenuChrome(int activeIdx) {
   }
   drawBatteryIcon(SW - 14, 1);
   display.drawLine(0, 10, SW - 1, 10, SSD1306_WHITE);
-  drawArrow(2, 20, false); drawArrow(SW - 10, 20, true);
-  int sp = 12;
-  int tw = m.count * sp - (sp - 6);
-  int sx = (SW - tw) / 2;
-  for (int i = 0; i < m.count; i++) {
-    int cx = sx + i * sp + 3;
-    if (i == activeIdx) display.fillCircle(cx, 44, 3, SSD1306_WHITE);
-    else display.drawCircle(cx, 44, 3, SSD1306_WHITE);
-  }
 }
 void drawCurrentMenu() {
   display.clearDisplay();
-  drawMenuChrome(menus[currentMenuIdx].index);
-  drawCenteredText(menus[currentMenuIdx].items[menus[currentMenuIdx].index], 18, 0, 2);
-  if (battValid && battPct <= LOW_BATTERY_WARN_PCT) {
-    display.setTextSize(1); display.setCursor(2, 56);
-    display.print("LOW BATTERY "); display.print(battPct); display.print("%");
+  MenuLevel &m = menus[currentMenuIdx];
+  drawMenuChrome();
+  int rows = (m.count < 3) ? m.count : 3;
+  int first = listStart(m.index, m.count, rows);
+  int top = 13 + (3 - rows) * 7;
+  for (int row = 0; row < rows; row++) {
+    int idx = first + row, y = top + row * 14;
+    bool selected = idx == m.index;
+    if (selected) {
+      display.fillRect(3, y, SW - 6, 12, SSD1306_WHITE);
+      display.setTextColor(SSD1306_BLACK);
+      display.setCursor(7, y + 2); display.print("> ");
+    } else display.setTextColor(SSD1306_WHITE);
+    drawCenteredText(m.items[idx], y + 2, selected ? 4 : 0, 1);
   }
-  display.display();
-}
-void drawAnimFrame() {
-  display.clearDisplay();
-  MenuLevel &m = menus[animMenuIdx];
-  int ad = (animOffset < SW / 2) ? animPrevIdx : m.index;
-  int si = m.index, sm = currentMenuIdx;
-  currentMenuIdx = animMenuIdx; drawMenuChrome(ad); currentMenuIdx = sm;
-  int os = -animDir * animOffset, ns = animDir * (SW - animOffset);
-  drawCenteredText(m.items[animPrevIdx], 18, os, 2);
-  drawCenteredText(m.items[si], 18, ns, 2);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(2, 56);
+  if (battValid && battPct <= LOW_BATTERY_WARN_PCT) {
+    display.print("LOW BATTERY "); display.print(battPct); display.print("%");
+  } else if (currentMenuIdx == 0) display.print("L/R move   M=OPEN");
+  else display.print("L/R move M=OPEN hM<");
   display.display();
 }
 void startAnim(int dir, int ni) {
-  if (animating) return;
-  animPrevIdx = menus[currentMenuIdx].index;
-  animDir = dir; menus[currentMenuIdx].index = ni;
-  animMenuIdx = currentMenuIdx; animOffset = 0; animating = true;
+  (void)dir;
+  menus[currentMenuIdx].index = ni;
+  drawCurrentMenu();
 }
 // =========================================================
 // WiFi
@@ -4031,26 +4017,16 @@ void loop() {
   updateClock();
   if (!chatServerRunning) tickNtp();
   static int lastMenuBatteryPct = -999;
-  if (currentScreen == SCR_MENU && !animating && lastMenuBatteryPct != battPct) {
+  if (currentScreen == SCR_MENU && lastMenuBatteryPct != battPct) {
     lastMenuBatteryPct = battPct;
     drawCurrentMenu();
   }
   uint32_t sleepAfter = (battValid && battPct <= 10) ? 30000UL : DISPLAY_SLEEP_MS;
-  if (currentScreen == SCR_MENU && !animating && millis() - lastBtnEventMs >= sleepAfter) {
+  if (currentScreen == SCR_MENU && millis() - lastBtnEventMs >= sleepAfter) {
     display.ssd1306_command(SSD1306_DISPLAYOFF);
     displaySleeping = true;
     delay(20);
     return;
-  }
-  if (animating) {
-    if (!anyBtnEvent()) {
-      animOffset += ANIM_STEP;
-      if (animOffset >= SW) { animating = false; drawCurrentMenu(); }
-      else drawAnimFrame();
-      return;
-    }
-    animating = false;
-    drawCurrentMenu();
   }
   if (currentScreen == SCR_MENU) handleMenuScreen();
   else handleTestScreen();
