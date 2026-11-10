@@ -4,7 +4,7 @@
 // v24.0: OLED Arcade
 // v25.0: battery saver, IR favorites, passive WiFi survey
 // v25.1: local tiny-chat AP and safe menu header layout
-//        later replaced by ten original three-button games
+//        now expanded to twenty original three-button games
 // ============================================================
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -853,7 +853,7 @@ const char* attackItems[] = { "Clone","Spam" };
 const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav","AI Chat" };
 const char* secItems[] = { "Passwords","Sniffer" };
 // Original Games menu: ten custom OLED mini-games.
-const char* gamesItems[] = { "Pulse Tap","Lane Shift","Orbit Relay","Echo Vault","Glyph Duel","Comet Route","Signal Sort","Core Keeper","Charge Dial","Phase Gate" };
+const char* gamesItems[] = { "Pulse Tap","Lane Shift","Orbit Relay","Echo Vault","Glyph Duel","Comet Route","Signal Sort","Core Keeper","Charge Dial","Phase Gate","Tiny Towers","Switchboard","Beacon Hunt","Gravity Flip","Counterweight","Number Wells","Code Lock","Last Light","Sunspot","Wind Tunnel" };
 const char* systemItems[] = { "Info","Space" };
 
 struct MenuLevel { const char* title; const char** items; int count; int index; int parent; };
@@ -865,7 +865,7 @@ MenuLevel menus[] = {
   { "Attacks",  attackItems,  2, 0,  1 },
   { "Tools",    toolsItems,   8, 0,  0 },
   { "Security", secItems,     2, 0,  0 },
-  { "Games",    gamesItems,   10, 0, 0 },
+  { "Games",    gamesItems,   20, 0, 0 },
   { "System",   systemItems,  2, 0,  0 },
 };
 int currentMenuIdx = 0;
@@ -2091,15 +2091,18 @@ void drawToolsClock() {
 }
 
 // =========================================================
-// ORIGINAL ARCADE: ten purpose-built games for OLED + three buttons.
+// ORIGINAL ARCADE: twenty purpose-built games for OLED + three buttons.
 // Controls: LEFT/RIGHT are short taps; SELECT acts per game; hold SELECT exits.
 // =========================================================
-const char* arcadeNames[10] = {
+const char* arcadeNames[20] = {
   "Pulse Tap", "Lane Shift", "Orbit Relay", "Echo Vault", "Glyph Duel",
-  "Comet Route", "Signal Sort", "Core Keeper", "Charge Dial", "Phase Gate"
+  "Comet Route", "Signal Sort", "Core Keeper", "Charge Dial", "Phase Gate",
+  "Tiny Towers", "Switchboard", "Beacon Hunt", "Gravity Flip", "Counterweight",
+  "Number Wells", "Code Lock", "Last Light", "Sunspot", "Wind Tunnel"
 };
 uint8_t arcadeId = 0, arcadeLives = 3, arcadeLane = 1, arcadePos = 0;
-uint8_t arcadeTarget = 0, arcadePhase = 0;
+uint8_t arcadeTarget = 0, arcadePhase = 0, arcadeAux = 0;
+uint8_t arcadeGuess[3] = {0,0,0};
 uint8_t arcadeSequence[24], arcadeSeqLen = 0, arcadeSeqAt = 0;
 uint8_t arcadeHazards[4] = {0,0,0,0};
 int16_t arcadeValue = 0;
@@ -2116,8 +2119,8 @@ void arcadeSaveBest() {
 }
 void arcadeFinish() { if (!arcadeOver) { arcadeOver = true; arcadeSaveBest(); } }
 void arcadeStart(uint8_t id) {
-  arcadeId = id % 10; arcadeScore = 0; arcadeLives = 3; arcadeLane = 1;
-  arcadePos = 0; arcadeTarget = 0; arcadePhase = 0;
+  arcadeId = id % 20; arcadeScore = 0; arcadeLives = 3; arcadeLane = 1;
+  arcadePos = 0; arcadeTarget = 0; arcadePhase = 0; arcadeAux = 0;
   arcadeSeqLen = 0; arcadeSeqAt = 0; arcadeValue = 0;
   arcadeDirection = 1; arcadeOver = false;
   arcadeLastStep = millis(); arcadeDeadline = millis() + 1000;
@@ -2135,6 +2138,16 @@ void arcadeStart(uint8_t id) {
     case 7: arcadeValue=0; arcadeLastStep=millis(); arcadeDeadline=millis()+5000; break;
     case 8: arcadeTarget=random(4,18); arcadeValue=10; arcadeDeadline=millis()+6000; break;
     case 9: arcadeTarget=random(3); arcadePhase=random(3); arcadeLastStep=millis(); arcadeDeadline=millis()+1300; break;
+    case 10: arcadePos=0; arcadeTarget=random(20,81); arcadeDirection=1; break;
+    case 11: arcadeLane=random(3); arcadeTarget=random(1,8); arcadePhase=random(1,8); if(arcadePhase==arcadeTarget) arcadePhase^=1; break;
+    case 12: arcadeTarget=random(21); arcadeValue=10; arcadeLives=5; break;
+    case 13: arcadeLane=1; arcadeTarget=random(2); arcadeLives=3; arcadeLastStep=millis(); break;
+    case 14: arcadeTarget=random(10,71); arcadeValue=0; arcadeLives=3; arcadeDeadline=millis()+1500; break;
+    case 15: arcadeTarget=random(5,22); arcadeValue=0; arcadeLives=3; arcadeAux=0; break;
+    case 16: arcadeLives=5; arcadeSeqAt=0; for(int i=0;i<3;i++) arcadeSequence[i]=random(3); break;
+    case 17: arcadePhase=random(1,8); arcadeLane=1; arcadeValue=0; break;
+    case 18: arcadeTarget=random(5); arcadePhase=random(2); arcadeLane=0; arcadeLives=3; break;
+    case 19: arcadeValue=50; arcadeTarget=random(20,81); arcadePhase=random(2)?1:255; arcadeLastStep=millis(); arcadeDeadline=millis()+3000; arcadeLives=3; break;
   }
 }
 void arcadeNewEchoRound() {
@@ -2234,6 +2247,64 @@ void drawArcade() {
       arcadeDrawGlyph(arcadePhase,84,38,11,SSD1306_WHITE);
       display.setCursor(17,56); display.print("GATE        NOW   M=pass"); break;
     }
+    case 10: {
+      display.setCursor(16,13); display.print("STACK THE MOVING DECK");
+      display.drawRect(14,34,100,10,SSD1306_WHITE);
+      display.drawRect(16+arcadeTarget,29,14,5,SSD1306_WHITE);
+      display.drawLine(16+arcadePos,25,16+arcadePos,48,SSD1306_WHITE);
+      display.setCursor(26,56); display.print("M=drop  tighter each time"); break;
+    }
+    case 11: {
+      display.setCursor(19,13); display.print("LIGHT EVERY SWITCH");
+      for(int i=0;i<3;i++) { int x=32+i*32; display.drawRect(x-7,27,14,14,SSD1306_WHITE); if(arcadeTarget&(1<<i)) display.fillCircle(x,34,3,SSD1306_WHITE); display.drawRect(x-9,46,18,8,SSD1306_WHITE); if(arcadePhase&(1<<i)) display.fillRect(x-6,48,12,4,SSD1306_WHITE); if(i==arcadeLane) display.drawRect(x-11,24,22,33,SSD1306_WHITE); }
+      display.setCursor(25,58); display.print("L/R select  M toggle"); break;
+    }
+    case 12: {
+      display.setCursor(18,13); display.print("HUNT THE HIDDEN BEACON");
+      display.drawRect(13,30,102,9,SSD1306_WHITE); display.drawLine(18+arcadeValue*4,27,18+arcadeValue*4,43,SSD1306_WHITE);
+      display.setCursor(33,47); display.print("Probe "); display.print(arcadeValue); display.print("  scans "); display.print(arcadeLives);
+      display.setCursor(25,58); display.print(arcadeAux==0?"L/R tune  M scan":arcadeAux==1?"COLD - search wider":"WARM - nearly there"); break;
+    }
+    case 13: {
+      display.setCursor(12,13); display.print("FLIP GRAVITY TO SURVIVE");
+      display.drawLine(16,29,112,29,SSD1306_WHITE); display.drawLine(16,49,112,49,SSD1306_WHITE);
+      display.fillCircle(28,arcadeLane?24:44,4,SSD1306_WHITE);
+      display.drawRect(90,arcadeTarget?20:40,12,9,SSD1306_WHITE);
+      display.setCursor(23,57); display.print("L=up R=down M=flip"); break;
+    }
+    case 14: {
+      display.setCursor(21,13); display.print("CATCH THE WEIGHT");
+      display.drawRect(10,32,108,12,SSD1306_WHITE); display.drawLine(64+(int)arcadeTarget-40,28,64+(int)arcadeTarget-40,48,SSD1306_WHITE);
+      display.fillCircle(64+arcadeValue,38,4,SSD1306_WHITE);
+      display.setCursor(22,56); display.print("L/R shift  M=lock  "); display.print(arcadeLives); break;
+    }
+    case 15: {
+      display.setCursor(24,13); display.print("BUILD THE WELL NUMBER");
+      display.setTextSize(2); display.setCursor(34,27); display.print(arcadeValue); display.print(" / "); display.print(arcadeTarget); display.setTextSize(1);
+      display.setCursor(13,55); display.print("L -2   R +3   M +5"); break;
+    }
+    case 16: {
+      display.setCursor(24,13); display.print("CRACK THE THREE-GLYPH CODE");
+      for(int i=0;i<3;i++) { int x=38+i*26; if(i<arcadeSeqAt) arcadeDrawGlyph(arcadeGuess[i],x,36,7,SSD1306_WHITE); else display.drawCircle(x,36,7,SSD1306_WHITE); }
+      display.setCursor(21,51); display.print("tries "); display.print(arcadeLives); display.print("  L/M/R = O/^/[]");
+      display.setCursor(23,59); display.print("exact matches: "); display.print(arcadeAux); break;
+    }
+    case 17: {
+      display.setCursor(24,13); display.print("TURN OFF EVERY LIGHT");
+      for(int i=0;i<3;i++){int x=40+i*24; if(arcadePhase&(1<<i)) display.fillCircle(x,36,7,SSD1306_WHITE); else display.drawCircle(x,36,7,SSD1306_WHITE); if(i==arcadeLane) display.drawRect(x-9,25,18,22,SSD1306_WHITE);}
+      display.setCursor(17,56); display.print("L/R move  M flip neighbors"); break;
+    }
+    case 18: {
+      display.setCursor(26,13); display.print("FIND THE ODD STAR");
+      for(int i=0;i<5;i++){int x=20+i*22; arcadeDrawGlyph((i==arcadeTarget)?1-arcadePhase:arcadePhase,x,36,5,SSD1306_WHITE); if(i==arcadeLane) display.drawRect(x-8,26,16,20,SSD1306_WHITE);}
+      display.setCursor(28,56); display.print("L/R choose  M=mark"); break;
+    }
+    case 19: {
+      display.setCursor(18,13); display.print("STEER THROUGH CROSSWIND");
+      display.drawRect(12,31,104,12,SSD1306_WHITE); display.drawLine(20+arcadeTarget,28,20+arcadeTarget,46,SSD1306_WHITE);
+      display.fillCircle(20+arcadeValue,37,4,SSD1306_WHITE);
+      display.setCursor(19,56); display.print("L/R steer M trim "); display.print(arcadeLives); break;
+    }
   }
   display.display();
 }
@@ -2269,6 +2340,19 @@ void arcadeTick() {
     case 9:
       if(now-arcadeLastStep>=350){arcadeLastStep=now;arcadePhase=(arcadePhase+1)%3;}
       if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish();
+      break;
+    case 10:
+      if(now-arcadeLastStep>=20){arcadeLastStep=now;int p=(int)arcadePos+arcadeDirection*(arcadeScore>8?4:2);if(p>=88){p=88;arcadeDirection=-1;}if(p<=0){p=0;arcadeDirection=1;}arcadePos=p;}
+      break;
+    case 13:
+      if(now-arcadeLastStep>=(uint32_t)max(220,560-(int)arcadeScore*8)){arcadeLastStep=now;arcadeTarget=random(2);arcadeScore++;if(arcadeTarget==arcadeLane){if(arcadeLives)arcadeLives--;if(!arcadeLives)arcadeFinish();}}
+      break;
+    case 14:
+      if((int32_t)(now-arcadeDeadline)>=0){if(arcadeLives)arcadeLives--;arcadeTarget=random(10,71);arcadeDeadline=now+1500;if(!arcadeLives)arcadeFinish();}
+      break;
+    case 19:
+      if(now-arcadeLastStep>=250){arcadeLastStep=now;arcadeValue+=arcadePhase==1?2:-2;arcadePhase=random(2)?1:255;if(arcadeValue<0||arcadeValue>100){if(arcadeLives)arcadeLives--;arcadeValue=constrain(arcadeValue,0,100);if(!arcadeLives)arcadeFinish();}}
+      if((int32_t)(now-arcadeDeadline)>=0){if(arcadeLives)arcadeLives--;arcadeTarget=random(20,81);arcadeDeadline=now+3000;if(!arcadeLives)arcadeFinish();}
       break;
   }
 }
@@ -2317,6 +2401,39 @@ bool arcadeInput(uint8_t key) {
       if(key==1 && arcadePhase==arcadeTarget){arcadeScore++; arcadeTarget=random(3); arcadeDeadline=millis()+(uint32_t)max(430,1300-(int)arcadeScore*22);}
       else arcadeFinish();
       break;
+    case 10: {
+      int tolerance=max(4,12-(int)arcadeScore/2); if(abs((int)arcadePos-(int)arcadeTarget)<=tolerance){arcadeScore++;arcadeTarget=arcadePos;}else arcadeFinish(); arcadeDirection=-arcadeDirection; break;
+    }
+    case 11:
+      if(key==0)arcadeLane=(arcadeLane+2)%3;else if(key==2)arcadeLane=(arcadeLane+1)%3;else {arcadePhase^=1<<arcadeLane;if(arcadePhase==arcadeTarget){arcadeScore++;arcadeTarget=random(1,8);arcadePhase=random(1,8);if(arcadePhase==arcadeTarget)arcadePhase^=1;}}
+      break;
+    case 12:
+      if(key==0)arcadeValue=max(0,(int)arcadeValue-1);else if(key==2)arcadeValue=min(20,(int)arcadeValue+1);else {int d=abs((int)arcadeValue-(int)arcadeTarget);if(d<=1){arcadeScore++;arcadeTarget=random(21);arcadeValue=10;arcadeAux=0;}else {if(arcadeLives)arcadeLives--;arcadeAux=d<=3?2:1;if(!arcadeLives)arcadeFinish();}}
+      break;
+    case 13:
+      if(key==0)arcadeLane=0;else if(key==2)arcadeLane=1;else arcadeLane^=1;
+      break;
+    case 14:
+      if(key==0)arcadeValue=max(-40,(int)arcadeValue-4);else if(key==2)arcadeValue=min(40,(int)arcadeValue+4);else {int d=abs((int)arcadeValue-((int)arcadeTarget-40));if(d<=7){arcadeScore++;arcadeTarget=random(10,71);arcadeDeadline=millis()+1500;}else {if(arcadeLives)arcadeLives--;if(!arcadeLives)arcadeFinish();}}
+      break;
+    case 15:
+      if(key==0)arcadeValue-=2;else if(key==2)arcadeValue+=3;else arcadeValue+=5;
+      if(arcadeValue==arcadeTarget){arcadeScore++;arcadeTarget=random(5,22);arcadeValue=0;}
+      else if(arcadeValue>arcadeTarget){if(arcadeLives)arcadeLives--;arcadeTarget=random(5,22);arcadeValue=0;if(!arcadeLives)arcadeFinish();}
+      break;
+    case 16:
+      if(arcadeSeqAt<3)arcadeGuess[arcadeSeqAt++]=key;
+      if(arcadeSeqAt>=3){int matches=0;for(int i=0;i<3;i++)if(arcadeGuess[i]==arcadeSequence[i])matches++;arcadeAux=matches;if(matches==3){arcadeScore++;for(int i=0;i<3;i++)arcadeSequence[i]=random(3);}else {if(arcadeLives)arcadeLives--;if(!arcadeLives)arcadeFinish();}arcadeSeqAt=0;}
+      break;
+    case 17:
+      if(key==0)arcadeLane=(arcadeLane+2)%3;else if(key==2)arcadeLane=(arcadeLane+1)%3;else {arcadePhase^=(1<<arcadeLane);if(arcadeLane>0)arcadePhase^=(1<<(arcadeLane-1));if(arcadeLane<2)arcadePhase^=(1<<(arcadeLane+1));arcadeValue++;if(!arcadePhase){arcadeScore++;arcadePhase=random(1,8);arcadeValue=0;}}
+      break;
+    case 18:
+      if(key==0)arcadeLane=(arcadeLane+4)%5;else if(key==2)arcadeLane=(arcadeLane+1)%5;else if(arcadeLane==arcadeTarget){arcadeScore++;arcadeTarget=random(5);arcadePhase=random(2);}else {if(arcadeLives)arcadeLives--;if(!arcadeLives)arcadeFinish();}
+      break;
+    case 19:
+      if(key==0)arcadeValue=max(0,(int)arcadeValue-5);else if(key==2)arcadeValue=min(100,(int)arcadeValue+5);else if(abs((int)arcadeValue-(int)arcadeTarget)<=6){arcadeScore++;arcadeTarget=random(20,81);arcadeDeadline=millis()+3000;}else {if(arcadeLives)arcadeLives--;arcadeDeadline=millis()+3000;if(!arcadeLives)arcadeFinish();}
+      break;
   }
   return true;
 }
@@ -2338,6 +2455,16 @@ void handleArcade() {
   else if(arcadeId==7) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
   else if(arcadeId==8) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
   else if(arcadeId==9 && m) arcadeInput(1);
+  else if(arcadeId==10 && m) arcadeInput(1);
+  else if(arcadeId==11) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
+  else if(arcadeId==12 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==13 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==14 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==15 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==16 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==17 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==18 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==19 && (l||m||r)) arcadeInput(l?0:m?1:2);
   static uint32_t lastDraw=0;
   if(dirty || millis()-lastDraw>75 || arcadeOver){lastDraw=millis();drawArcade();}
 }
