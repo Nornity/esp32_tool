@@ -19,6 +19,7 @@
 #include <math.h>
 #include <esp_wifi.h>
 #include <esp_wifi_types.h>
+#include <esp_sleep.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include "tiny_chat_intent.h"
@@ -423,6 +424,7 @@ int battPct = -1;
 uint32_t lastBattMs = 0, lastBtnEventMs = 0;
 #define LOW_BATTERY_WARN_PCT 15
 #define DISPLAY_SLEEP_MS 90000UL
+#define AUTO_DEEP_SLEEP_MS 120000UL
 bool displaySleeping = false;
 
 float readBatteryVoltage() {
@@ -3967,6 +3969,28 @@ void drawBootMsg(const char* msg) {
   display.setCursor(10, 28); display.print(msg);
   display.display();
 }
+bool tryAutoDeepSleep() {
+  if (currentScreen != SCR_MENU || chatServerRunning || scanMode != SCAN_OFF ||
+      ntpState != NTP_IDLE || cloneRunning || spamRunning || snifferRunning || deauthRunning ||
+      millis() - lastBtnEventMs < AUTO_DEEP_SLEEP_MS) return false;
+  if (digitalRead(BTN_L) == LOW || digitalRead(BTN_R) == LOW || digitalRead(BTN_M) == LOW) {
+    lastBtnEventMs = millis(); return false;
+  }
+  delay(40);
+  if (digitalRead(BTN_L) == LOW || digitalRead(BTN_R) == LOW || digitalRead(BTN_M) == LOW) {
+    lastBtnEventMs = millis(); return false;
+  }
+  WiFi.disconnect(true); WiFi.mode(WIFI_OFF);
+  display.ssd1306_command(SSD1306_DISPLAYOFF);
+  uint64_t wakeMask = (1ULL << BTN_L) | (1ULL << BTN_R) | (1ULL << BTN_M);
+  if (esp_deep_sleep_enable_gpio_wakeup(wakeMask, ESP_GPIO_WAKEUP_GPIO_LOW) != ESP_OK) {
+    display.ssd1306_command(SSD1306_DISPLAYON); displaySleeping = false;
+    lastBtnEventMs = millis(); drawCurrentMenu(); return false;
+  }
+  Serial.flush();
+  esp_deep_sleep_start();
+  return true; // Deep sleep starts a fresh boot when any key is pressed.
+}
 void setup() {
   Serial.begin(115200);
   configureChatRoutes();
@@ -4000,6 +4024,7 @@ void setup() {
 void loop() {
   pollButton(btnLeft); pollButton(btnRight); pollButton(btnSelect);
   if (chatServerRunning) chatWeb.handleClient();
+  if (tryAutoDeepSleep()) return;
   if (displaySleeping) {
     updateBattery();
     updateClock();
@@ -4016,6 +4041,7 @@ void loop() {
   updateBattery();
   updateClock();
   if (!chatServerRunning) tickNtp();
+  if (tryAutoDeepSleep()) return;
   static int lastMenuBatteryPct = -999;
   if (currentScreen == SCR_MENU && lastMenuBatteryPct != battPct) {
     lastMenuBatteryPct = battPct;
