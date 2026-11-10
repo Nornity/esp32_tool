@@ -1,10 +1,10 @@
 // ============================================================
 // TRICORDER v25.1
 // v23.1: новая клавиатура 10×4
-// v24.0: Games — Arcade/Logic/Cards/Idle
+// v24.0: OLED Arcade
 // v25.0: battery saver, IR favorites, passive WiFi survey
 // v25.1: local tiny-chat AP and safe menu header layout
-//        Tetris, Pong, Flappy, Doodle, Blackjack, BJ Multi, Farm
+//        later replaced by ten original three-button games
 // ============================================================
 #include <Wire.h>
 #include <Adafruit_GFX.h>
@@ -56,7 +56,6 @@ struct Btn;
 struct IrDevice;
 struct IrFavorite;
 struct WifiAp;
-struct BJack;
 void haltScan();
 
 enum ScanMode { SCAN_OFF, SCAN_ON };
@@ -68,36 +67,6 @@ int speedCode = 0;
 bool speedDone = false;
 bool deauthRunning = false, cloneRunning = false, spamRunning = false, snifferRunning = false;
 uint32_t lastRadioActiveMs = 0;
-
-// ---- High scores ----
-int hiSnake = 0, hi2048 = 0, hiSimon = 0;
-int hiTetris = 0, hiFlappy = 0, hiDoodle = 0;
-int hiReactor = 0;
-uint32_t hiFarm = 0;
-int hiBJ = 0;
-void loadHighScores() {
-  prefs.begin("hscore", true);
-  hiSnake  = prefs.getInt("snake", 0);
-  hi2048   = prefs.getInt("g2048", 0);
-  hiSimon  = prefs.getInt("simon", 0);
-  hiTetris = prefs.getInt("tetris", 0);
-  hiFlappy = prefs.getInt("flappy", 0);
-  hiDoodle = prefs.getInt("doodle", 0);
-  hiFarm   = prefs.getUInt("farm", 0);
-  hiBJ     = prefs.getInt("bj", 0);
-  hiReactor = prefs.getInt("reactor", 0);
-  prefs.end();
-}
-void saveHighScore(const char* key, int val) {
-  prefs.begin("hscore", false);
-  prefs.putInt(key, val);
-  prefs.end();
-}
-void saveHighScoreU(const char* key, uint32_t val) {
-  prefs.begin("hscore", false);
-  prefs.putUInt(key, val);
-  prefs.end();
-}
 
 // ---- Battery cal ----
 float battCal = BATT_CAL_DEF;
@@ -883,8 +852,8 @@ const char* testItems[] = { "Ping","Speed" };
 const char* attackItems[] = { "Clone","Spam" };
 const char* toolsItems[] = { "Random","PassGen","Battery","BattCal","Clock","Macro","IR Fav","AI Chat" };
 const char* secItems[] = { "Passwords","Sniffer" };
-// v24.1+: плоский Games с авторской головоломкой Reactor
-const char* gamesItems[] = { "Snake","Pong","Flappy","Doodle","Mines","2048","Simon","Tetris","BJ","Farm","Reactor" };
+// Original Games menu: ten custom OLED mini-games.
+const char* gamesItems[] = { "Pulse Tap","Lane Shift","Orbit Relay","Echo Vault","Glyph Duel","Comet Route","Signal Sort","Core Keeper","Charge Dial","Phase Gate" };
 const char* systemItems[] = { "Info","Space" };
 
 struct MenuLevel { const char* title; const char** items; int count; int index; int parent; };
@@ -896,7 +865,7 @@ MenuLevel menus[] = {
   { "Attacks",  attackItems,  2, 0,  1 },
   { "Tools",    toolsItems,   8, 0,  0 },
   { "Security", secItems,     2, 0,  0 },
-  { "Games",    gamesItems,   11, 0, 0 },
+  { "Games",    gamesItems,   10, 0, 0 },
   { "System",   systemItems,  2, 0,  0 },
 };
 int currentMenuIdx = 0;
@@ -913,9 +882,7 @@ enum Screen {
   SCR_IR_POWER, SCR_IR_TV, SCR_IR_KEYS, SCR_IR_AUTO, SCR_IR_FAVORITES,
   SCR_TOOLS_RANDOM, SCR_TOOLS_PASSWORD, SCR_TOOLS_BATTERY, SCR_TOOLS_BATTCAL, SCR_TOOLS_CLOCK, SCR_TOOLS_CHAT,
   SCR_TOOLS_MACRO, SCR_TOOLS_MACRO_EDIT,
-  SCR_MINES, SCR_SNAKE, SCR_2048, SCR_SIMON,
-  SCR_TETRIS, SCR_PONG, SCR_FLAPPY, SCR_DOODLE,
-  SCR_BJ, SCR_BJM, SCR_FARM, SCR_REACTOR,
+  SCR_ARCADE,
   SCR_SNIFFER, SCR_INFO, SCR_SPACE
 };
 Screen currentScreen = SCR_MENU;
@@ -2124,904 +2091,255 @@ void drawToolsClock() {
 }
 
 // =========================================================
-// GAMES: Mines, Snake, 2048, Simon
+// ORIGINAL ARCADE: ten purpose-built games for OLED + three buttons.
+// Controls: LEFT/RIGHT are short taps; SELECT acts per game; hold SELECT exits.
 // =========================================================
-#define MS_SIZE 8
-#define MS_MINES 10
-#define MS_CELL 6
-#define MS_X 4
-#define MS_Y 10
-struct MsCell { uint8_t mine : 1; uint8_t open : 1; uint8_t flag : 1; uint8_t num : 4; };
-MsCell msGrid[MS_SIZE][MS_SIZE];
-int msCurIdx = 27, msOpened = 0, msFlags = 0;
-bool msGameOver = false, msWon = false, msMinesPlaced = false;
-uint32_t msStartTime = 0;
-void msPlaceMines(int exX, int exY) {
-  int pl = 0;
-  while (pl < MS_MINES) {
-    int x = random(MS_SIZE), y = random(MS_SIZE);
-    if (msGrid[y][x].mine || (abs(x - exX) <= 1 && abs(y - exY) <= 1)) continue;
-    msGrid[y][x].mine = 1; pl++;
-  }
-  for (int y = 0; y < MS_SIZE; y++) for (int x = 0; x < MS_SIZE; x++) {
-    if (msGrid[y][x].mine) continue;
-    int n = 0;
-    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-      if (!dx && !dy) continue;
-      int nx = x + dx, ny = y + dy;
-      if (nx >= 0 && nx < MS_SIZE && ny >= 0 && ny < MS_SIZE && msGrid[ny][nx].mine) n++;
-    }
-    msGrid[y][x].num = n;
-  }
-}
-void msInit() {
-  msOpened = 0; msFlags = 0; msGameOver = false; msWon = false; msMinesPlaced = false;
-  msCurIdx = 27; msStartTime = millis();
-  for (int y = 0; y < MS_SIZE; y++) for (int x = 0; x < MS_SIZE; x++) msGrid[y][x] = {0, 0, 0, 0};
-}
-void msReveal(int x, int y) {
-  if (x < 0 || x >= MS_SIZE || y < 0 || y >= MS_SIZE) return;
-  if (msGrid[y][x].open || msGrid[y][x].flag) return;
-  msGrid[y][x].open = 1; msOpened++;
-  if (msGrid[y][x].mine) { msGameOver = true; return; }
-  if (msGrid[y][x].num == 0)
-    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++)
-      if (dx || dy) msReveal(x + dx, y + dy);
-}
-void drawMines() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (msGameOver) display.print("GAME OVER");
-  else if (msWon) display.print("YOU WIN!");
-  else { display.print("M:"); display.print(MS_MINES - msFlags); display.print(" T:"); display.print((millis() - msStartTime) / 1000); }
-  for (int y = 0; y < MS_SIZE; y++) for (int x = 0; x < MS_SIZE; x++) {
-    int px = MS_X + x * MS_CELL, py = MS_Y + y * MS_CELL;
-    MsCell &c = msGrid[y][x];
-    bool cur = (y * MS_SIZE + x) == msCurIdx && !msGameOver && !msWon;
-    if (cur) { display.fillRect(px, py, MS_CELL, MS_CELL, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
-    else { display.setTextColor(SSD1306_WHITE); if (!c.open) display.drawRect(px, py, MS_CELL, MS_CELL, SSD1306_WHITE); }
-    if (c.open) {
-      if (c.mine) {
-        display.drawLine(px + 1, py + 1, px + MS_CELL - 2, py + MS_CELL - 2, cur ? SSD1306_BLACK : SSD1306_WHITE);
-        display.drawLine(px + MS_CELL - 2, py + 1, px + 1, py + MS_CELL - 2, cur ? SSD1306_BLACK : SSD1306_WHITE);
-      } else if (c.num > 0) { display.setCursor(px + 1, py); display.print(c.num); }
-    } else if (c.flag) display.fillRect(px + 2, py + 2, 3, 3, cur ? SSD1306_BLACK : SSD1306_WHITE);
-  }
-  display.setTextColor(SSD1306_WHITE);
-  int rx = MS_X + MS_SIZE * MS_CELL + 6;
-  if (msGameOver || msWon) {
-    display.setCursor(rx, 20); display.print("M=");
-    display.setCursor(rx, 30); display.print("new");
-    display.setCursor(rx, 44); display.print("hM=");
-    display.setCursor(rx, 54); display.print("exit");
-  } else {
-    int cx = msCurIdx % MS_SIZE, cy = msCurIdx / MS_SIZE;
-    display.setCursor(rx, 10); display.print("L/R mv");
-    display.setCursor(rx, 22); display.print("hL/R ud");
-    display.setCursor(rx, 34); display.print("M=open");
-    display.setCursor(rx, 46);
-    display.print(msGrid[cy][cx].open ? "hM=exit" : "hM=flag");
-  }
-  display.display();
-}
-
-#define SN_SIZE 8
-#define SN_CELL 6
-#define SN_X 4
-#define SN_Y 10
-int8_t snX[64], snY[64];
-int snLen = 0;
-int snDir = 1;
-int snAppleX = 0, snAppleY = 0;
-bool snGameOver = false;
-bool snPaused = false;
-uint32_t snLastMove = 0;
-const uint32_t SN_SPEED_MS = 350;
-void snSpawnApple() {
-  while (true) {
-    int ax = random(SN_SIZE), ay = random(SN_SIZE);
-    bool ok = true;
-    for (int i = 0; i < snLen; i++) if (snX[i] == ax && snY[i] == ay) { ok = false; break; }
-    if (ok) { snAppleX = ax; snAppleY = ay; return; }
-  }
-}
-void snInit() {
-  snLen = 3;
-  snX[0] = 3; snY[0] = 3;
-  snX[1] = 2; snY[1] = 3;
-  snX[2] = 1; snY[2] = 3;
-  snDir = 1;
-  snGameOver = false; snPaused = false;
-  snLastMove = millis();
-  snSpawnApple();
-}
-void snStep() {
-  if (snGameOver || snPaused) return;
-  if (millis() - snLastMove < SN_SPEED_MS) return;
-  snLastMove = millis();
-  int nx = snX[0], ny = snY[0];
-  if (snDir == 0) ny--;
-  else if (snDir == 1) nx++;
-  else if (snDir == 2) ny++;
-  else if (snDir == 3) nx--;
-  if (nx < 0 || nx >= SN_SIZE || ny < 0 || ny >= SN_SIZE) { snGameOver = true; return; }
-  for (int i = 0; i < snLen - 1; i++) if (snX[i] == nx && snY[i] == ny) { snGameOver = true; return; }
-  bool ate = (nx == snAppleX && ny == snAppleY);
-  for (int i = snLen - 1; i > 0; i--) { snX[i] = snX[i-1]; snY[i] = snY[i-1]; }
-  snX[0] = nx; snY[0] = ny;
-  if (ate && snLen < 64) { snLen++; snSpawnApple(); }
-}
-void drawSnake() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (snGameOver) display.print("OVER  len:");
-  else if (snPaused) display.print("PAUSE len:");
-  else display.print("Snake len:");
-  display.print(snLen); display.print(" hi:"); display.print(hiSnake);
-  int rx = SN_X + SN_SIZE * SN_CELL + 6;
-  display.drawRect(SN_X - 1, SN_Y - 1, SN_SIZE * SN_CELL + 2, SN_SIZE * SN_CELL + 2, SSD1306_WHITE);
-  display.fillRect(SN_X + snAppleX * SN_CELL + 1, SN_Y + snAppleY * SN_CELL + 1, SN_CELL - 2, SN_CELL - 2, SSD1306_WHITE);
-  for (int i = 0; i < snLen; i++) {
-    if (i == 0) display.fillRect(SN_X + snX[i] * SN_CELL, SN_Y + snY[i] * SN_CELL, SN_CELL, SN_CELL, SSD1306_WHITE);
-    else display.fillRect(SN_X + snX[i] * SN_CELL + 1, SN_Y + snY[i] * SN_CELL + 1, SN_CELL - 2, SN_CELL - 2, SSD1306_WHITE);
-  }
-  if (snGameOver) {
-    display.setCursor(rx, 12); display.print("M=");
-    display.setCursor(rx, 22); display.print("new");
-    display.setCursor(rx, 36); display.print("hM=");
-    display.setCursor(rx, 46); display.print("exit");
-  } else {
-    display.setCursor(rx, 12); display.print("L/R");
-    display.setCursor(rx, 22); display.print("turn");
-    display.setCursor(rx, 36); display.print("M=");
-    display.setCursor(rx, 46); display.print("pause");
-  }
-  display.display();
-}
-
-#define G_SIZE 4
-uint16_t g2048[G_SIZE][G_SIZE];
-bool g2048Over = false;
-bool g2048Won = false;
-uint32_t g2048Score = 0;
-void g2048Spawn() {
-  int free = 0;
-  for (int y = 0; y < G_SIZE; y++) for (int x = 0; x < G_SIZE; x++) if (g2048[y][x] == 0) free++;
-  if (free == 0) return;
-  int r = random(free);
-  for (int y = 0; y < G_SIZE; y++) for (int x = 0; x < G_SIZE; x++) {
-    if (g2048[y][x] == 0) {
-      if (r == 0) { g2048[y][x] = (random(10) == 0) ? 4 : 2; return; }
-      r--;
-    }
-  }
-}
-void g2048Init() {
-  memset(g2048, 0, sizeof(g2048));
-  g2048Score = 0; g2048Over = false; g2048Won = false;
-  g2048Spawn(); g2048Spawn();
-}
-bool g2048Slide(int dir) {
-  bool moved = false;
-  for (int pass = 0; pass < G_SIZE; pass++) {
-    for (int i = 0; i < G_SIZE; i++) {
-      int coords[G_SIZE];
-      for (int j = 0; j < G_SIZE; j++) coords[j] = j;
-      if (dir == 1 || dir == 3) { for (int j = 0; j < G_SIZE/2; j++) { int t = coords[j]; coords[j] = coords[G_SIZE-1-j]; coords[G_SIZE-1-j] = t; } }
-      uint16_t line[G_SIZE];
-      for (int j = 0; j < G_SIZE; j++) {
-        if (dir < 2) line[j] = g2048[i][coords[j]];
-        else line[j] = g2048[coords[j]][i];
-      }
-      uint16_t nl[G_SIZE] = {0,0,0,0};
-      int pos = 0;
-      for (int j = 0; j < G_SIZE; j++) {
-        if (line[j] == 0) continue;
-        if (pos > 0 && nl[pos-1] == line[j]) { nl[pos-1] *= 2; g2048Score += nl[pos-1]; pos--; moved = true; }
-        else { nl[pos++] = line[j]; }
-      }
-      for (int j = 0; j < G_SIZE; j++) {
-        if (dir < 2) g2048[i][coords[j]] = nl[j];
-        else g2048[coords[j]][i] = nl[j];
-      }
-    }
-  }
-  return moved;
-}
-void g2048Check() {
-  bool free = false;
-  for (int y = 0; y < G_SIZE; y++) for (int x = 0; x < G_SIZE; x++) if (g2048[y][x] == 0) free = true;
-  if (free) return;
-  for (int y = 0; y < G_SIZE; y++) for (int x = 0; x < G_SIZE; x++) {
-    if (x < G_SIZE - 1 && g2048[y][x] == g2048[y][x+1]) return;
-    if (y < G_SIZE - 1 && g2048[y][x] == g2048[y+1][x]) return;
-  }
-  g2048Over = true;
-}
-void g2048DrawCell(int x, int y, uint16_t v) {
-  int px = x * 30 + 2, py = y * 12 + 12;
-  display.drawRect(px, py, 29, 11, SSD1306_WHITE);
-  if (v == 0) return;
-  if (v >= 128) display.fillRect(px + 1, py + 1, 27, 9, SSD1306_WHITE);
-  display.setTextColor(v >= 128 ? SSD1306_BLACK : SSD1306_WHITE);
-  char b[6]; snprintf(b, sizeof(b), "%u", v);
-  int16_t x1, y1; uint16_t w, h;
-  display.getTextBounds(b, 0, 0, &x1, &y1, &w, &h);
-  display.setCursor(px + (29 - w) / 2, py + 1);
-  display.print(b);
-  display.setTextColor(SSD1306_WHITE);
-}
-void draw2048() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (g2048Over) display.print("OVER ");
-  else if (g2048Won) display.print("WIN! ");
-  else display.print("2048 ");
-  display.print(g2048Score); display.print(" hi:"); display.print(hi2048);
-  for (int y = 0; y < G_SIZE; y++) for (int x = 0; x < G_SIZE; x++)
-    g2048DrawCell(x, y, g2048[y][x]);
-  display.setCursor(2, 60);
-  display.print(g2048Over ? "M=new hM=out" : "L/R hL/R=M=undo");
-  display.display();
-}
-
-#define SIM_MAX 20
-uint8_t simSeq[SIM_MAX];
-int simLen = 0;
-int simShowIdx = 0;
-int simInputIdx = 0;
-bool simShowing = false;
-bool simGameOver = false;
-uint32_t simLastAction = 0;
-int simFlash = -1;
-uint32_t simFlashUntil = 0;
-void simInit() {
-  simLen = 1;
-  simSeq[0] = random(3);
-  simShowIdx = 0; simInputIdx = 0;
-  simShowing = true; simGameOver = false;
-  simFlash = -1; simLastAction = millis();
-}
-void simStep() {
-  if (simGameOver) return;
-  uint32_t now = millis();
-  if (simFlash >= 0 && now > simFlashUntil) simFlash = -1;
-  if (simShowing) {
-    if (simFlash >= 0) return;
-    if (now - simLastAction < 300) return;
-    simLastAction = now;
-    if (simShowIdx >= simLen) { simShowing = false; simInputIdx = 0; return; }
-    simFlash = simSeq[simShowIdx++];
-    simFlashUntil = now + 250;
-  }
-}
-void simPress(int idx) {
-  if (simShowing || simGameOver || simFlash >= 0) return;
-  if (simSeq[simInputIdx] == idx) {
-    simInputIdx++;
-    if (simInputIdx >= simLen) {
-      if (simLen >= SIM_MAX) { simGameOver = true; return; }
-      simSeq[simLen] = random(3); simLen++;
-      simShowIdx = 0; simShowing = true; simInputIdx = 0;
-      simLastAction = millis() - 500;
-    }
-  } else simGameOver = true;
-}
-const char* simLabels[] = { "L", "M", "R" };
-void drawSimon() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (simGameOver) display.print("OVER  lvl:");
-  else if (simShowing) display.print("Watch  lvl:");
-  else display.print("Repeat lvl:");
-  display.print(simLen); display.print(" hi:"); display.print(hiSimon);
-  for (int i = 0; i < 3; i++) {
-    int cx = 22 + i * 42, cy = 32;
-    bool on = (simFlash == i);
-    if (on) { display.fillCircle(cx, cy, 15, SSD1306_WHITE); display.setTextColor(SSD1306_BLACK); }
-    else { display.drawCircle(cx, cy, 15, SSD1306_WHITE); display.setTextColor(SSD1306_WHITE); }
-    display.setTextSize(2);
-    int16_t x1, y1; uint16_t w, h;
-    display.getTextBounds(simLabels[i], 0, 0, &x1, &y1, &w, &h);
-    display.setCursor(cx - w/2, cy - 6);
-    display.print(simLabels[i]);
-    display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  }
-  display.setCursor(2, 56);
-  if (simGameOver) display.print("M=new hM=out");
-  else if (simShowing) display.print("Watch...");
-  else display.print("L M R press");
-  display.display();
-}
-
-// =========================================================
-// GAMES: Tetris, Pong, Flappy, Doodle
-// =========================================================
-#define T_W 8
-#define T_H 16
-#define T_PX 3
-#define T_X 4
-#define T_Y 10
-uint8_t tGrid[T_H][T_W];
-int tCurX = 0, tCurY = 0, tCurType = 0, tCurRot = 0;
-int tNextType = 0;
-uint32_t tScore = 0;
-bool tGameOver = false, tPaused = false;
-uint32_t tLastDrop = 0;
-const uint32_t T_DROP_MS = 500;
-const uint8_t tShapes[7][4][4] = {
-  { {0,0,0,0},{1,1,1,1},{0,0,0,0},{0,0,0,0} },
-  { {0,1,1,0},{0,1,1,0},{0,0,0,0},{0,0,0,0} },
-  { {0,1,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0} },
-  { {0,1,1,0},{1,1,0,0},{0,0,0,0},{0,0,0,0} },
-  { {1,1,0,0},{0,1,1,0},{0,0,0,0},{0,0,0,0} },
-  { {1,0,0,0},{1,1,1,0},{0,0,0,0},{0,0,0,0} },
-  { {0,0,1,0},{1,1,1,0},{0,0,0,0},{0,0,0,0} },
+const char* arcadeNames[10] = {
+  "Pulse Tap", "Lane Shift", "Orbit Relay", "Echo Vault", "Glyph Duel",
+  "Comet Route", "Signal Sort", "Core Keeper", "Charge Dial", "Phase Gate"
 };
-bool tCanPlace(int type, int rot, int px, int py) {
-  for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
-    int sx = x, sy = y;
-    for (int r = 0; r < rot; r++) { int t = sx; sx = 3 - sy; sy = t; }
-    if (!tShapes[type][sy][sx]) continue;
-    int gx = px + x, gy = py + y;
-    if (gx < 0 || gx >= T_W || gy >= T_H) return false;
-    if (gy >= 0 && tGrid[gy][gx]) return false;
+uint8_t arcadeId = 0, arcadeLives = 3, arcadeLane = 1, arcadePos = 0;
+uint8_t arcadeTarget = 0, arcadePhase = 0;
+uint8_t arcadeSequence[24], arcadeSeqLen = 0, arcadeSeqAt = 0;
+uint8_t arcadeHazards[4] = {0,0,0,0};
+int16_t arcadeValue = 0;
+int32_t arcadeScore = 0, arcadeBest = 0;
+int8_t arcadeDirection = 1;
+bool arcadeOver = false;
+uint32_t arcadeLastStep = 0, arcadeDeadline = 0;
+
+void arcadeSaveBest() {
+  if (arcadeScore <= arcadeBest) return;
+  arcadeBest = arcadeScore;
+  char key[5]; snprintf(key, sizeof(key), "g%u", arcadeId);
+  prefs.begin("arcade", false); prefs.putInt(key, arcadeBest); prefs.end();
+}
+void arcadeFinish() { if (!arcadeOver) { arcadeOver = true; arcadeSaveBest(); } }
+void arcadeStart(uint8_t id) {
+  arcadeId = id % 10; arcadeScore = 0; arcadeLives = 3; arcadeLane = 1;
+  arcadePos = 0; arcadeTarget = 0; arcadePhase = 0;
+  arcadeSeqLen = 0; arcadeSeqAt = 0; arcadeValue = 0;
+  arcadeDirection = 1; arcadeOver = false;
+  arcadeLastStep = millis(); arcadeDeadline = millis() + 1000;
+  for (int i=0;i<4;i++) arcadeHazards[i] = 0;
+  char key[5]; snprintf(key, sizeof(key), "g%u", arcadeId);
+  prefs.begin("arcade", true); arcadeBest = prefs.getInt(key, 0); prefs.end();
+  switch (arcadeId) {
+    case 0: arcadePos=0; arcadeDirection=1; arcadeTarget=random(20,81); break;
+    case 1: for (int i=0;i<4;i++) arcadeHazards[i]=random(0,8); arcadeLastStep=millis(); break;
+    case 2: arcadePos=random(24); do{arcadeTarget=random(24);}while(arcadeTarget==arcadePos); arcadeLastStep=millis(); break;
+    case 3: arcadeSeqLen=3; for(int i=0;i<arcadeSeqLen;i++) arcadeSequence[i]=random(3); arcadePhase=0; arcadeSeqAt=0; arcadeDeadline=millis()+450; break;
+    case 4: arcadeTarget=random(3); arcadeDeadline=millis()+1400; break;
+    case 5: arcadeTarget=random(1,8); arcadeDeadline=millis()+1800; break;
+    case 6: arcadeTarget=random(1,10); arcadeDeadline=millis()+1200; break;
+    case 7: arcadeValue=0; arcadeLastStep=millis(); arcadeDeadline=millis()+5000; break;
+    case 8: arcadeTarget=random(4,18); arcadeValue=10; arcadeDeadline=millis()+6000; break;
+    case 9: arcadeTarget=random(3); arcadePhase=random(3); arcadeLastStep=millis(); arcadeDeadline=millis()+1300; break;
+  }
+}
+void arcadeNewEchoRound() {
+  if (arcadeSeqLen < 23) arcadeSequence[arcadeSeqLen++] = random(3);
+  arcadePhase=0; arcadeSeqAt=0; arcadeDeadline=millis()+450;
+}
+void arcadeDrawGlyph(uint8_t glyph, int x, int y, int size, uint16_t color) {
+  if (glyph==0) display.drawCircle(x,y,size,color);
+  else if (glyph==1) { display.drawLine(x,y-size,x-size,y+size,color); display.drawLine(x-size,y+size,x+size,y+size,color); display.drawLine(x+size,y+size,x,y-size,color); }
+  else display.drawRect(x-size,y-size,size*2,size*2,color);
+}
+void drawArcade() {
+  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
+  display.setCursor(1,0); display.print(arcadeNames[arcadeId]);
+  display.setCursor(86,0); display.print("S:"); display.print(arcadeScore);
+  display.drawLine(0,9,SW-1,9,SSD1306_WHITE);
+  if (arcadeOver) {
+    drawCenteredText("ROUND OVER",20,0,1);
+    display.setCursor(30,31); display.print("Score "); display.print(arcadeScore);
+    display.setCursor(30,42); display.print("Best  "); display.print(arcadeBest);
+    display.setCursor(22,54); display.print("M=retry  hM=exit");
+    display.display(); return;
+  }
+  switch (arcadeId) {
+    case 0: {
+      display.setCursor(3,13); display.print("STOP THE PULSE IN THE BAND");
+      display.drawRect(10,34,108,12,SSD1306_WHITE);
+      int tx=12+arcadeTarget; display.fillRect(tx-5,36,11,8,SSD1306_WHITE);
+      int px=12+arcadePos; display.drawLine(px,29,px,50,SSD1306_WHITE);
+      display.setCursor(28,54); display.print("SELECT = lock on target"); break;
+    }
+    case 1: {
+      display.setCursor(2,12); display.print("SHIFT LANES. DON'T HIT!");
+      for(int c=0;c<3;c++) display.drawLine(22+c*42,20,22+c*42,56,SSD1306_WHITE);
+      for(int r=0;r<4;r++) for(int c=0;c<3;c++) if(arcadeHazards[r]&(1<<c)) display.fillRect(13+c*42,18+r*9,18,5,SSD1306_WHITE);
+      display.drawRect(13+arcadeLane*42,47,18,7,SSD1306_WHITE);
+      display.setCursor(2,55); display.print("HP:"); display.print(arcadeLives); break;
+    }
+    case 2: {
+      display.setCursor(20,12); display.print("CATCH THE ORBITING SPARK");
+      display.drawCircle(64,39,19,SSD1306_WHITE);
+      int ta=arcadeTarget*15, pa=arcadePos*15;
+      int tx=64+(int)(17*cos(ta*0.0174533f)), ty=39+(int)(17*sin(ta*0.0174533f));
+      int px=64+(int)(17*cos(pa*0.0174533f)), py=39+(int)(17*sin(pa*0.0174533f));
+      display.fillCircle(tx,ty,3,SSD1306_WHITE); display.drawCircle(px,py,4,SSD1306_WHITE);
+      display.setCursor(42,56); display.print("SELECT to relay"); break;
+    }
+    case 3: {
+      display.setCursor(9,13); display.print(arcadePhase==0?"MEMORIZE THE ECHO":"REPEAT: L  M  R");
+      if(arcadePhase==0 && arcadeSeqAt<arcadeSeqLen) {
+        uint8_t g=arcadeSequence[arcadeSeqAt];
+        display.fillRoundRect(45,23,38,30,5,SSD1306_WHITE); display.setTextColor(SSD1306_BLACK);
+        display.setCursor(57,33); display.print(g==0?"L":g==1?"M":"R"); display.setTextColor(SSD1306_WHITE);
+        display.setCursor(35,56); display.print("Pattern "); display.print(arcadeSeqLen);
+      } else {
+        display.drawRoundRect(8,25,112,26,5,SSD1306_WHITE);
+        display.setCursor(23,35); display.print("Input "); display.print(arcadeSeqAt); display.print(" / "); display.print(arcadeSeqLen);
+        display.setCursor(25,56); display.print("L      M      R");
+      } break;
+    }
+    case 4: {
+      display.setCursor(14,13); display.print("MATCH THE GLYPH FAST");
+      arcadeDrawGlyph(arcadeTarget,64,35,13,SSD1306_WHITE);
+      display.setCursor(15,56); display.print("L=O  M=^  R=[]");
+      break;
+    }
+    case 5: {
+      display.setCursor(12,13); display.print("PICK A SAFE COMET GATE");
+      for(int c=0;c<3;c++) {
+        int x=24+c*40; bool safe=(arcadeTarget&(1<<c));
+        display.drawRect(x-10,26,20,25,SSD1306_WHITE);
+        if(safe) display.drawLine(x-6,44,x+6,32,SSD1306_WHITE);
+        if(c==arcadeLane) display.drawRect(x-12,24,24,29,SSD1306_WHITE);
+      }
+      display.setCursor(27,56); display.print("L/R choose M dive"); break;
+    }
+    case 6: {
+      display.setCursor(7,13); display.print("SORT: 3x > ODD > EVEN");
+      display.setTextSize(3); display.setCursor(52,24); display.print(arcadeTarget); display.setTextSize(1);
+      display.setCursor(19,55); display.print("L=odd  M=3x  R=even"); break;
+    }
+    case 7: {
+      display.setCursor(7,13); display.print("KEEP CORE PRESSURE SAFE");
+      display.drawRect(10,32,108,12,SSD1306_WHITE); display.drawLine(64,29,64,47,SSD1306_WHITE);
+      int x=64+arcadeValue; display.fillCircle(x,38,4,SSD1306_WHITE);
+      display.setCursor(4,53); display.print("L/R regulate  M=vent  "); display.print(arcadeLives); break;
+    }
+    case 8: {
+      display.setCursor(14,13); display.print("DIAL TO THE CHARGE");
+      display.setTextSize(2); display.setCursor(40,25); display.print(arcadeValue); display.print(" -> "); display.print(arcadeTarget); display.setTextSize(1);
+      display.setCursor(10,54); display.print("L -1   R +1   M lock"); break;
+    }
+    case 9: {
+      display.setCursor(14,13); display.print("HIT WHEN PHASES ALIGN");
+      arcadeDrawGlyph(arcadeTarget,43,38,11,SSD1306_WHITE);
+      display.drawLine(64,18,64,54,SSD1306_WHITE);
+      arcadeDrawGlyph(arcadePhase,84,38,11,SSD1306_WHITE);
+      display.setCursor(17,56); display.print("GATE        NOW   M=pass"); break;
+    }
+  }
+  display.display();
+}
+void arcadeTick() {
+  uint32_t now=millis();
+  switch(arcadeId) {
+    case 0:
+      if(now-arcadeLastStep>=18) { arcadeLastStep=now; int p=(int)arcadePos+arcadeDirection*(arcadeScore>12?4:arcadeScore>5?3:2); if(p>=100){p=100;arcadeDirection=-1;} if(p<=0){p=0;arcadeDirection=1;} arcadePos=p; }
+      break;
+    case 1:
+      if(now-arcadeLastStep>=(uint32_t)max(180,520-(int)arcadeScore*10)) {
+        arcadeLastStep=now; for(int r=3;r>0;r--) arcadeHazards[r]=arcadeHazards[r-1];
+        arcadeHazards[0]=random(0,8); if(arcadeHazards[0]==7 && random(2)) arcadeHazards[0]=random(0,7);
+        arcadeScore++; if(arcadeHazards[3]&(1<<arcadeLane)) { if(arcadeLives) arcadeLives--; if(!arcadeLives) arcadeFinish(); }
+      } break;
+    case 2:
+      if(now-arcadeLastStep>=(uint32_t)max(25,75-(int)arcadeScore*2)){arcadeLastStep=now; arcadePos=(arcadePos+1)%24;}
+      break;
+    case 3:
+      if(arcadePhase==0 && (int32_t)(now-arcadeDeadline)>=0) { arcadeSeqAt++; if(arcadeSeqAt>=arcadeSeqLen){arcadePhase=1;arcadeSeqAt=0;} arcadeDeadline=now+450; }
+      break;
+    case 4: if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish(); break;
+    case 5: if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish(); break;
+    case 6: if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish(); break;
+    case 7:
+      if(now-arcadeLastStep>=170) {
+        arcadeLastStep=now; int drift=random(-3,4); arcadeValue+=drift;
+        if(arcadeValue>38 || arcadeValue< -38) { if(arcadeLives) arcadeLives--; arcadeValue=constrain(arcadeValue,-34,34); if(!arcadeLives) arcadeFinish(); }
+      }
+      if((int32_t)(now-arcadeDeadline)>=0){arcadeScore++; arcadeDeadline=now+5000;}
+      break;
+    case 8: if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish(); break;
+    case 9:
+      if(now-arcadeLastStep>=350){arcadeLastStep=now;arcadePhase=(arcadePhase+1)%3;}
+      if((int32_t)(now-arcadeDeadline)>=0) arcadeFinish();
+      break;
+  }
+}
+bool arcadeInput(uint8_t key) {
+  switch(arcadeId) {
+    case 0: {
+      int d=abs((int)arcadePos-(int)arcadeTarget);
+      if(d<=7){arcadeScore++; arcadeTarget=random(12,89); arcadeDirection=-arcadeDirection;} else arcadeFinish();
+      break;
+    }
+    case 1: arcadeLane=constrain((int)arcadeLane+(key==0?-1:key==2?1:0),0,2); break;
+    case 2: {
+      int d=abs((int)arcadePos-(int)arcadeTarget); if(d>12)d=24-d;
+      if(d<=1){arcadeScore++; do{arcadeTarget=random(24);}while(arcadeTarget==arcadePos);}
+      else arcadeFinish();
+      break;
+    }
+    case 3:
+      if(arcadePhase==0) break;
+      if(key!=arcadeSequence[arcadeSeqAt]) arcadeFinish();
+      else if(++arcadeSeqAt>=arcadeSeqLen){arcadeScore++; arcadeNewEchoRound();}
+      break;
+    case 4:
+      if(key==arcadeTarget){arcadeScore++; arcadeTarget=random(3); arcadeDeadline=millis()+(uint32_t)max(430,1250-(int)arcadeScore*28);}
+      else arcadeFinish();
+      break;
+    case 5:
+      if(key==0) arcadeLane=(arcadeLane+2)%3; else if(key==2) arcadeLane=(arcadeLane+1)%3;
+      else {if(arcadeTarget&(1<<arcadeLane)){arcadeScore++; arcadeTarget=random(1,8); arcadeDeadline=millis()+max(600,1800-(int)arcadeScore*25);}else arcadeFinish();}
+      break;
+    case 6: {
+      int n=arcadeTarget; uint8_t correct=(n%3==0)?1:(n%2?0:2);
+      if(key==correct){arcadeScore++; arcadeTarget=random(1,10); arcadeDeadline=millis()+(uint32_t)max(400,1100-(int)arcadeScore*18);}
+      else arcadeFinish();
+      break;
+    }
+    case 7:
+      if(key==0) arcadeValue-=5; else if(key==2) arcadeValue+=5; else {arcadeValue=0; arcadeDeadline=millis()+5000;}
+      break;
+    case 8:
+      if(key==0) arcadeValue--; else if(key==2) arcadeValue++;
+      else if(arcadeValue==arcadeTarget){arcadeScore++; arcadeTarget=random(4,18); arcadeValue=10; arcadeDeadline=millis()+6000;}
+      else arcadeFinish();
+      arcadeValue=constrain(arcadeValue,0,25); break;
+    case 9:
+      if(key==1 && arcadePhase==arcadeTarget){arcadeScore++; arcadeTarget=random(3); arcadeDeadline=millis()+(uint32_t)max(430,1300-(int)arcadeScore*22);}
+      else arcadeFinish();
+      break;
   }
   return true;
 }
-void tLockPiece() {
-  for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
-    int sx = x, sy = y;
-    for (int r = 0; r < tCurRot; r++) { int t = sx; sx = 3 - sy; sy = t; }
-    if (!tShapes[tCurType][sy][sx]) continue;
-    int gx = tCurX + x, gy = tCurY + y;
-    if (gy >= 0 && gy < T_H && gx >= 0 && gx < T_W) tGrid[gy][gx] = tCurType + 1;
-  }
-  int cleared = 0;
-  for (int y = T_H - 1; y >= 0; y--) {
-    bool full = true;
-    for (int x = 0; x < T_W; x++) if (!tGrid[y][x]) { full = false; break; }
-    if (full) {
-      cleared++;
-      for (int yy = y; yy > 0; yy--) for (int x = 0; x < T_W; x++) tGrid[yy][x] = tGrid[yy-1][x];
-      for (int x = 0; x < T_W; x++) tGrid[0][x] = 0;
-      y++;
-    }
-  }
-  if (cleared == 1) tScore += 100;
-  else if (cleared == 2) tScore += 300;
-  else if (cleared == 3) tScore += 500;
-  else if (cleared == 4) tScore += 800;
-  tCurType = tNextType;
-  tNextType = random(7);
-  tCurRot = 0;
-  tCurX = T_W / 2 - 2;
-  tCurY = 0;
-  if (!tCanPlace(tCurType, tCurRot, tCurX, tCurY)) tGameOver = true;
-}
-void tInit() {
-  memset(tGrid, 0, sizeof(tGrid));
-  tScore = 0; tGameOver = false; tPaused = false;
-  tCurType = random(7); tNextType = random(7);
-  tCurRot = 0; tCurX = T_W / 2 - 2; tCurY = 0;
-  tLastDrop = millis();
-}
-void tStep() {
-  if (tGameOver || tPaused) return;
-  if (millis() - tLastDrop < T_DROP_MS) return;
-  tLastDrop = millis();
-  if (tCanPlace(tCurType, tCurRot, tCurX, tCurY + 1)) tCurY++;
-  else tLockPiece();
-}
-void drawTetris() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (tGameOver) display.print("OVER ");
-  else if (tPaused) display.print("PAUSE ");
-  else display.print("Tetris ");
-  display.print(tScore); display.print(" hi:"); display.print(hiTetris);
-  display.drawRect(T_X - 1, T_Y - 1, T_W * T_PX + 2, T_H * T_PX + 2, SSD1306_WHITE);
-  for (int y = 0; y < T_H; y++) for (int x = 0; x < T_W; x++)
-    if (tGrid[y][x]) display.fillRect(T_X + x * T_PX, T_Y + y * T_PX, T_PX, T_PX, SSD1306_WHITE);
-  if (!tGameOver) {
-    for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++) {
-      int sx = x, sy = y;
-      for (int r = 0; r < tCurRot; r++) { int t = sx; sx = 3 - sy; sy = t; }
-      if (!tShapes[tCurType][sy][sx]) continue;
-      int gx = tCurX + x, gy = tCurY + y;
-      if (gy >= 0 && gy < T_H && gx >= 0 && gx < T_W)
-        display.fillRect(T_X + gx * T_PX, T_Y + gy * T_PX, T_PX, T_PX, SSD1306_WHITE);
-    }
-  }
-  int nx = T_X + T_W * T_PX + 6;
-  display.setCursor(nx, 12); display.print("Next");
-  for (int y = 0; y < 4; y++) for (int x = 0; x < 4; x++)
-    if (tShapes[tNextType][y][x]) display.fillRect(nx + x * 3, 22 + y * 3, 3, 3, SSD1306_WHITE);
-  display.setCursor(nx, 42); display.print("L/R");
-  display.setCursor(nx, 50); display.print("hL rot");
-  display.setCursor(nx, 58); display.print("hM out");
-  display.display();
-}
-
-int pBallX, pBallY, pBallDx, pBallDy;
-int pPaddleX, pAiX;
-int pScoreP, pScoreAi;
-bool pPaused = false, pGameOver = false;
-uint32_t pLastMove = 0;
-const uint32_t P_SPEED = 40;
-const int P_PW = 16;
-const int P_TOP = 12;
-const int P_BOT = 62;
-void pResetBall(int dir) {
-  pBallX = 64; pBallY = 36;
-  pBallDx = dir > 0 ? 2 : -2;
-  pBallDy = (random(2) ? 1 : -1);
-}
-void pInit() {
-  pPaddleX = 64 - P_PW / 2; pAiX = 64 - P_PW / 2;
-  pScoreP = 0; pScoreAi = 0;
-  pGameOver = false; pPaused = false;
-  pResetBall(1); pLastMove = millis();
-}
-void pStep() {
-  if (pPaused || pGameOver) return;
-  if (millis() - pLastMove < P_SPEED) return;
-  pLastMove = millis();
-  pBallX += pBallDx; pBallY += pBallDy;
-  if (pBallX <= 1) { pBallX = 1; pBallDx = -pBallDx; }
-  if (pBallX >= SW - 2) { pBallX = SW - 2; pBallDx = -pBallDx; }
-  if (pBallY <= P_TOP + 1) {
-    pScoreP++;
-    if (pScoreP >= 5) { pGameOver = true; return; }
-    pResetBall(-1); return;
-  }
-  if (pBallY >= P_BOT - 1) {
-    pScoreAi++;
-    if (pScoreAi >= 5) { pGameOver = true; return; }
-    pResetBall(1); return;
-  }
-  if (pBallY >= P_BOT - 4 && pBallY <= P_BOT - 1 && pBallDy > 0) {
-    if (pBallX >= pPaddleX && pBallX <= pPaddleX + P_PW) {
-      pBallDy = -pBallDy;
-      int off = pBallX - (pPaddleX + P_PW / 2);
-      pBallDx = off / 3; if (pBallDx == 0) pBallDx = 1;
-    }
-  }
-  if (pBallY <= P_TOP + 4 && pBallY >= P_TOP && pBallDy < 0) {
-    if (pBallX >= pAiX && pBallX <= pAiX + P_PW) {
-      pBallDy = -pBallDy;
-      int off = pBallX - (pAiX + P_PW / 2);
-      pBallDx = off / 3; if (pBallDx == 0) pBallDx = 1;
-    }
-  }
-  int target = pBallX - P_PW / 2;
-  if (pAiX < target - 2) pAiX += 2;
-  else if (pAiX > target + 2) pAiX -= 2;
-  if (pAiX < 0) pAiX = 0;
-  if (pAiX > SW - P_PW) pAiX = SW - P_PW;
-}
-// v24.3: Pong без наложений — футер убран, статус в шапку
-void drawPong() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(2, 0);
-  if (pGameOver) {
-    display.print(pScoreP > pScoreAi ? "WIN " : "LOSE ");
-    display.print(pScoreP); display.print(":"); display.print(pScoreAi);
-    display.setCursor(SW - 36, 0);
-    display.print("M=new");
-  } else {
-    display.print("Pong ");
-    display.print(pScoreP); display.print(":"); display.print(pScoreAi);
-    display.setCursor(SW - 36, 0);
-    display.print("L/R hM");
-  }
-  display.drawLine(0, 9, SW - 1, 9, SSD1306_WHITE);
-
-  for (int y = P_TOP + 2; y < P_BOT - 4; y += 4) display.drawPixel(64, y, SSD1306_WHITE);
-
-  display.fillRect(pAiX, P_TOP, P_PW, 3, SSD1306_WHITE);
-  display.fillRect(pPaddleX, P_BOT - 3, P_PW, 3, SSD1306_WHITE);
-  display.fillRect(pBallX, pBallY, 3, 3, SSD1306_WHITE);
-
-  display.display();
-}
-
-int fBirdY, fVel, fPipeX, fGapY, fScore;
-bool fGameOver;
-uint32_t fLastMove;
-const uint32_t F_SPEED = 60;
-const int F_PIPE_GAP = 24;    // v24.2: 20 → 24
-const int F_BIRD_X = 20;
-const int F_TOP = 12;
-const int F_BOT = 62;
-void fResetPipe() {
-  fPipeX = SW;
-  fGapY = F_TOP + 6 + random(F_BOT - F_TOP - F_PIPE_GAP - 12);
-}
-void fInit() {
-  fBirdY = 36; fVel = 0; fScore = 0; fGameOver = false;
-  fResetPipe(); fLastMove = millis();
-}
-void fStep() {
-  if (fGameOver) return;
-  if (millis() - fLastMove < F_SPEED) return;
-  fLastMove = millis();
-  fVel++; if (fVel > 3) fVel = 3;
-  fBirdY += fVel;
-  fPipeX -= 2;
-  if (fPipeX < -12) { fPipeX = SW; fGapY = F_TOP + 6 + random(F_BOT - F_TOP - F_PIPE_GAP - 12); fScore++; }
-  if (fBirdY < F_TOP || fBirdY > F_BOT - 3) fGameOver = true;
-  // v24.2: коллизия по всему перекрытию (труба 8px + bird 4px)
-  if (fPipeX + 8 > F_BIRD_X && fPipeX < F_BIRD_X + 4) {
-    if (fBirdY < fGapY || fBirdY + 3 > fGapY + F_PIPE_GAP) fGameOver = true;
-  }
-}
-void fFlap() { if (!fGameOver) fVel = -7; }  // v24.2: -3 → -7
-void drawFlappy() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (fGameOver) display.print("OVER ");
-  else display.print("Flappy ");
-  display.print(fScore); display.print(" hi:"); display.print(hiFlappy);
-  display.fillRect(fPipeX, F_TOP, 8, fGapY - F_TOP, SSD1306_WHITE);
-  display.fillRect(fPipeX, fGapY + F_PIPE_GAP, 8, F_BOT - fGapY - F_PIPE_GAP, SSD1306_WHITE);
-  display.fillRect(F_BIRD_X, fBirdY, 4, 3, SSD1306_WHITE);
-  display.setCursor(2, 56);
-  if (fGameOver) display.print("M=new hM=out");
-  else display.print("L/R=flap hM=out");  // v24.2
-  display.display();
-}
-
-struct DoodPlat { int x, y; };
-#define DOOD_NP 8
-DoodPlat dPlats[DOOD_NP];
-int dBirdX, dBirdY, dVel, dCam;
-bool dGameOver;
-uint32_t dLastMove;
-const uint32_t D_SPEED = 40;
-// v24.2: старт повыше + платформы ниже
-void doodInit() {
-  dBirdX = 64; dBirdY = 45; dVel = 0; dCam = 0; dGameOver = false;
-  for (int i = 0; i < DOOD_NP; i++) { dPlats[i].x = random(SW - 16); dPlats[i].y = 62 - i * 10; }
-  dLastMove = millis();
-}
-void doodStep() {
-  if (dGameOver) return;
-  if (millis() - dLastMove < D_SPEED) return;
-  dLastMove = millis();
-  // v24.2: dVel>4, зона +4, прыжок -7
-  dVel++; if (dVel > 4) dVel = 4;
-  dBirdY += dVel;
-  if (dVel > 0) {
-    for (int i = 0; i < DOOD_NP; i++) {
-      if (dBirdY + 3 >= dPlats[i].y && dBirdY + 3 <= dPlats[i].y + 4
-          && dBirdX + 3 >= dPlats[i].x && dBirdX <= dPlats[i].x + 15) { dVel = -7; break; }
-    }
-  }
-  if (dBirdY < 25) {
-    int shift = 25 - dBirdY;
-    dBirdY = 25;
-    for (int i = 0; i < DOOD_NP; i++) dPlats[i].y += shift;
-    dCam += shift;
-  }
-  for (int i = 0; i < DOOD_NP; i++) {
-    if (dPlats[i].y > F_BOT + 5) { dPlats[i].y = F_TOP - 5; dPlats[i].x = random(SW - 16); }
-  }
-  if (dBirdY > F_BOT + 3) dGameOver = true;
-  if (dBirdX < 0) dBirdX = 0;
-  if (dBirdX > SW - 4) dBirdX = SW - 4;
-}
-void drawDoodle() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (dGameOver) display.print("OVER ");
-  else display.print("Doodle ");
-  display.print(dCam / 10); display.print("m hi:"); display.print(hiDoodle);
-  for (int i = 0; i < DOOD_NP; i++) display.fillRect(dPlats[i].x, dPlats[i].y, 16, 2, SSD1306_WHITE);
-  display.fillRect(dBirdX, dBirdY, 4, 4, SSD1306_WHITE);
-  display.setCursor(2, 56);
-  if (dGameOver) display.print("M=new hM=out");
-  else display.print("L/R move hM=out");
-  display.display();
-}
-
-// =========================================================
-// GAMES: Blackjack, BJ Multi, Farm
-// =========================================================
-struct BJack { uint8_t cards[10]; int nCards; int total; bool done, bust, stand; };
-BJack bjPlayer[3];
-BJack bjDealer;
-int bjHands = 1;
-int bjHand = 0;
-bool bjGameOver = false, bjWin = false;
-uint32_t bjSessionWin = 0;
-int bjDrawCard() {
-  int c = random(1, 14);
-  if (c == 1) return 11;
-  if (c > 10) return 10;
-  return c;
-}
-int bjSum(BJack &h) {
-  int s = 0, aces = 0;
-  for (int i = 0; i < h.nCards; i++) { s += h.cards[i]; if (h.cards[i] == 11) aces++; }
-  while (s > 21 && aces > 0) { s -= 10; aces--; }
-  return s;
-}
-void bjInit(int hands) {
-  bjHands = hands; bjHand = 0; bjGameOver = false; bjWin = false;
-  for (int i = 0; i < 3; i++) { bjPlayer[i].nCards = 0; bjPlayer[i].bust = false; bjPlayer[i].stand = false; bjPlayer[i].done = false; }
-  bjDealer.nCards = 0;
-  for (int i = 0; i < bjHands; i++) {
-    bjPlayer[i].cards[bjPlayer[i].nCards++] = bjDrawCard();
-    bjPlayer[i].cards[bjPlayer[i].nCards++] = bjDrawCard();
-    bjPlayer[i].total = bjSum(bjPlayer[i]);
-  }
-  bjDealer.cards[bjDealer.nCards++] = bjDrawCard();
-  bjDealer.cards[bjDealer.nCards++] = bjDrawCard();
-  bjDealer.total = bjSum(bjDealer);
-}
-void bjHit(int hand) {
-  BJack &h = bjPlayer[hand];
-  if (h.stand || h.bust || h.nCards >= 10) return;
-  h.cards[h.nCards++] = bjDrawCard();
-  h.total = bjSum(h);
-  if (h.total > 21) h.bust = true;
-  else if (h.total == 21) h.stand = true;
-}
-void bjStand(int hand) { bjPlayer[hand].stand = true; }
-void bjFinish() {
-  bool allDone = true;
-  for (int i = 0; i < bjHands; i++) if (!bjPlayer[i].stand && !bjPlayer[i].bust) allDone = false;
-  if (!allDone) return;
-  while (bjDealer.total < 17 && bjDealer.nCards < 10) {
-    bjDealer.cards[bjDealer.nCards++] = bjDrawCard();
-    bjDealer.total = bjSum(bjDealer);
-  }
-  bool anyWin = false;
-  for (int i = 0; i < bjHands; i++) {
-    if (bjPlayer[i].bust) continue;
-    if (bjDealer.total > 21 || bjPlayer[i].total > bjDealer.total) anyWin = true;
-  }
-  bjWin = anyWin;
-  if (anyWin) { bjSessionWin++; if ((int)bjSessionWin > hiBJ) { hiBJ = bjSessionWin; saveHighScore("bj", hiBJ); } }
-  bjGameOver = true;
-}
-void drawBJ() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (bjGameOver) display.print(bjWin ? "WIN!" : "LOSE");
-  else display.print(bjHands == 1 ? "Blackjack" : "BJ Multi");
-  display.print("  hi:"); display.print(hiBJ);
-  display.setCursor(2, 10);
-  display.print("Dealer:"); display.print(bjDealer.total);
-  int sy = 20;
-  for (int i = 0; i < bjHands; i++) {
-    BJack &h = bjPlayer[i];
-    int y = sy + i * 12;
-    bool sel = (i == bjHand && !bjGameOver);
-    if (sel) display.fillRect(0, y - 1, SW, 10, SSD1306_WHITE);
-    display.setTextColor(sel ? SSD1306_BLACK : SSD1306_WHITE);
-    display.setCursor(2, y);
-    display.print("H"); display.print(i+1); display.print(": ");
-    for (int j = 0; j < h.nCards && j < 6; j++) {
-      int v = h.cards[j];
-      if (v == 11) display.print("A");
-      else if (v == 10) display.print("X");
-      else display.print(v);
-    }
-    display.print("="); display.print(h.total);
-    if (h.bust) display.print(" X");
-    else if (h.stand) display.print(" S");
-  }
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 56);
-  if (bjGameOver) display.print("M=new hM=out");
-  else if (bjHands == 1) display.print("L=hit R=stand hM=out");
-  else display.print("L/R sel M=hit hM=std");
-  display.display();
-}
-
-#define FARM_PLOTS 4
-#define FARM_GROW_MS 20000
-uint32_t farmPlanted[FARM_PLOTS];
-uint32_t farmCash = 0;
-int farmUpg = 0;
-int farmSel = 0;
-bool farmStarted = false;
-void farmInit() {
-  memset(farmPlanted, 0, sizeof(farmPlanted));
-  farmCash = 0; farmUpg = 0; farmSel = 0; farmStarted = true;
-}
-uint32_t farmGrowMs() { return FARM_GROW_MS / (1 + farmUpg); }
-void farmAction() {
-  uint32_t now = millis();
-  int i = farmSel;
-  if (farmPlanted[i] == 0) farmPlanted[i] = now;
-  else if (now - farmPlanted[i] > farmGrowMs()) {
-    farmPlanted[i] = 0;
-    farmCash += 10 + farmUpg * 5;
-    if (farmCash > hiFarm) { hiFarm = farmCash; saveHighScoreU("farm", hiFarm); }
-  }
-}
-void farmUpgrade() {
-  uint32_t cost = 100 + farmUpg * 100;
-  if (farmCash >= cost) { farmCash -= cost; farmUpg++; }
-}
-// v24.3: 2×2 сетка, спрайт растения, прогресс-бар, READY мигает
-void drawFarm() {
-  display.clearDisplay();
-  display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-
-  display.setCursor(2, 0);
-  display.print("$"); display.print(farmCash);
-  uint32_t cost = 100 + farmUpg * 100;
-  char upg[20];
-  snprintf(upg, sizeof(upg), "Up%d $%lu", farmUpg, cost);
-  display.setCursor(SW - strlen(upg) * 6 - 2, 0);
-  display.print(upg);
-
-  display.drawLine(0, 9, SW - 1, 9, SSD1306_WHITE);
-
-  uint32_t now = millis();
-  uint32_t growMs = farmGrowMs();
-
-  for (int i = 0; i < FARM_PLOTS; i++) {
-    int col = i % 2, row = i / 2;
-    int px = 3 + col * 62;
-    int py = 12 + row * 20;
-    int pw = 58, ph = 16;
-
-    bool sel   = (i == farmSel);
-    bool ready = (farmPlanted[i] != 0) && (now - farmPlanted[i] >= growMs);
-
-    if (sel) display.drawRect(px - 2, py - 2, pw + 4, ph + 4, SSD1306_WHITE);
-    display.drawRect(px, py, pw, ph, SSD1306_WHITE);
-
-    if (farmPlanted[i] == 0) {
-      for (int x = px + 4; x < px + pw - 4; x += 6)
-        display.drawPixel(x, py + ph / 2, SSD1306_WHITE);
-      display.setCursor(px + 16, py + 4);
-      display.print("empty");
-    } else if (ready) {
-      bool flash = (millis() / 300) % 2;
-      if (flash) display.fillRect(px + 1, py + 1, pw - 2, ph - 2, SSD1306_WHITE);
-      display.setTextColor(flash ? SSD1306_BLACK : SSD1306_WHITE);
-      display.setCursor(px + 14, py + 4);
-      display.print("READY");
-      display.setTextColor(SSD1306_WHITE);
-    } else {
-      uint32_t elapsed = now - farmPlanted[i];
-      int stage = (elapsed * 4) / growMs;
-      if (stage > 3) stage = 3;
-
-      int sx = px + pw / 2;
-      int sy = py + ph - 2;
-      int height = 2 + stage * 2;
-
-      display.drawLine(sx, sy, sx, sy - height, SSD1306_WHITE);
-      display.drawPixel(sx - 2, sy - height / 2, SSD1306_WHITE);
-      display.drawPixel(sx + 2, sy - height / 2, SSD1306_WHITE);
-      if (stage >= 2) {
-        display.drawPixel(sx - 3, sy - height + 1, SSD1306_WHITE);
-        display.drawPixel(sx + 3, sy - height + 1, SSD1306_WHITE);
-      }
-      if (stage >= 3) {
-        display.fillCircle(sx, sy - height - 2, 1, SSD1306_WHITE);
-        display.drawPixel(sx - 1, sy - height - 1, SSD1306_WHITE);
-        display.drawPixel(sx + 1, sy - height - 1, SSD1306_WHITE);
-      }
-
-      int prog = (elapsed * (pw - 4)) / growMs;
-      if (prog > pw - 4) prog = pw - 4;
-      display.fillRect(px + 2, py + ph - 2, prog, 2, SSD1306_WHITE);
-    }
-  }
-
-  display.setCursor(2, 56);
-  display.print("M=act hL=upg hM=out");
-
-  display.display();
-}
-
-// =========================================================
-// Reactor Route: connect the incoming power line to the core output.
-// =========================================================
-#define RX_SIZE 4
-#define RX_CELLS (RX_SIZE * RX_SIZE)
-#define RX_CELL_PX 10
-#define RX_GRID_X 44
-#define RX_GRID_Y 12
-uint8_t reactorTiles[RX_CELLS];
-int reactorCursor = 0, reactorMoves = 0, reactorScore = 0;
-bool reactorSolved = false;
-
-uint8_t reactorRotate(uint8_t mask, int turns) {
-  while (turns-- > 0) mask = (uint8_t)(((mask << 1) & 0x0F) | (mask >> 3));
-  return mask;
-}
-bool reactorHasPowerPath();
-void reactorGenerate() {
-  reactorSolved = false; reactorCursor = 0; reactorMoves = 0;
-  bool onPath[RX_CELLS] = {false};
-  uint8_t solution[RX_CELLS] = {0};
-  uint8_t steps[6] = {1,1,1,2,2,2}; // east and south, shuffled into one guaranteed route
-  for (int i = 5; i > 0; i--) { int j = random(i + 1); uint8_t t = steps[i]; steps[i] = steps[j]; steps[j] = t; }
-  int px[7] = {0}, py[7] = {0};
-  for (int i = 0; i < 6; i++) { px[i+1] = px[i] + (steps[i] == 1); py[i+1] = py[i] + (steps[i] == 2); }
-  for (int k = 0; k < 7; k++) {
-    int incoming = (k == 0) ? 3 : (steps[k-1] + 2) % 4;
-    int outgoing = (k == 6) ? 1 : steps[k];
-    int cell = py[k] * RX_SIZE + px[k];
-    solution[cell] = (uint8_t)((1 << incoming) | (1 << outgoing));
-    onPath[cell] = true;
-  }
-  const uint8_t shapes[] = {0x05, 0x03, 0x07, 0x0F, 0x01};
-  for (int i = 0; i < RX_CELLS; i++) {
-    uint8_t shape = onPath[i] ? solution[i] : shapes[random(5)];
-    reactorTiles[i] = reactorRotate(shape, random(4));
-  }
-  for (int n = 0; n < 4 && reactorHasPowerPath(); n++)
-    reactorTiles[0] = reactorRotate(reactorTiles[0], 1);
-}
-void reactorStartGame() { reactorScore = 0; reactorGenerate(); }
-bool reactorHasPowerPath() {
-  if (!(reactorTiles[0] & 0x08)) return false; // external input enters from west
-  bool seen[RX_CELLS] = {false}; int queue[RX_CELLS], head = 0, tail = 0;
-  queue[tail++] = 0; seen[0] = true;
-  const int dx[4] = {0,1,0,-1}, dy[4] = {-1,0,1,0};
-  while (head < tail) {
-    int cell = queue[head++], x = cell % RX_SIZE, y = cell / RX_SIZE;
-    for (int d = 0; d < 4; d++) {
-      if (!(reactorTiles[cell] & (1 << d))) continue;
-      int nx = x + dx[d], ny = y + dy[d];
-      if (nx < 0 || nx >= RX_SIZE || ny < 0 || ny >= RX_SIZE) continue;
-      int next = ny * RX_SIZE + nx, opposite = (d + 2) % 4;
-      if (!(reactorTiles[next] & (1 << opposite))) continue;
-      if (!seen[next]) { seen[next] = true; queue[tail++] = next; }
-    }
-  }
-  return seen[RX_CELLS - 1] && (reactorTiles[RX_CELLS - 1] & 0x02); // core output east
-}
-void drawReactor() {
-  display.clearDisplay(); display.setTextSize(1); display.setTextColor(SSD1306_WHITE);
-  display.setCursor(2, 0);
-  if (reactorSolved) display.print("CORE STABLE!");
-  else { display.print("R"); display.print(reactorScore + 1); display.print(" M"); display.print(reactorMoves); }
-  display.setCursor(91, 0); display.print("HI "); display.print(hiReactor);
-  int cy0 = RX_GRID_Y + RX_CELL_PX / 2;
-  display.drawLine(RX_GRID_X - 4, cy0, RX_GRID_X, cy0, SSD1306_WHITE);
-  display.setCursor(26, cy0 - 3); display.print("IN");
-  int outY = RX_GRID_Y + 3 * RX_CELL_PX + RX_CELL_PX/2;
-  display.drawLine(RX_GRID_X + RX_SIZE * RX_CELL_PX, outY,
-                   RX_GRID_X + RX_SIZE * RX_CELL_PX + 4, outY, SSD1306_WHITE);
-  display.setCursor(91, outY - 3); display.print("OUT");
-  for (int cell = 0; cell < RX_CELLS; cell++) {
-    int x = RX_GRID_X + (cell % RX_SIZE) * RX_CELL_PX;
-    int y = RX_GRID_Y + (cell / RX_SIZE) * RX_CELL_PX;
-    bool selected = cell == reactorCursor;
-    if (selected) display.fillRect(x, y, RX_CELL_PX, RX_CELL_PX, SSD1306_WHITE);
-    uint16_t ink = selected ? SSD1306_BLACK : SSD1306_WHITE;
-    display.drawRect(x, y, RX_CELL_PX, RX_CELL_PX, ink);
-    int cx = x + RX_CELL_PX/2, cy = y + RX_CELL_PX/2;
-    if (reactorTiles[cell] & 0x01) display.drawLine(cx, cy, cx, y + 1, ink);
-    if (reactorTiles[cell] & 0x02) display.drawLine(cx, cy, x + RX_CELL_PX - 2, cy, ink);
-    if (reactorTiles[cell] & 0x04) display.drawLine(cx, cy, cx, y + RX_CELL_PX - 2, ink);
-    if (reactorTiles[cell] & 0x08) display.drawLine(cx, cy, x + 1, cy, ink);
-    display.drawPixel(cx, cy, ink);
-  }
-  display.setCursor(2, 56);
-  display.print(reactorSolved ? "M=next hM=exit" : "L/R=cell M=turn");
-  display.display();
+void handleArcade() {
+  if(takeLong(btnSelect)) { btnLeft.fireOnPress=true; btnRight.fireOnPress=true; currentMenuIdx=7; currentScreen=SCR_MENU; drawCurrentMenu(); return; }
+  if(arcadeOver) { if(takeShort(btnSelect)){arcadeStart(arcadeId);drawArcade();} return; }
+  int32_t oldScore=arcadeScore; uint8_t oldLane=arcadeLane, oldPos=arcadePos, oldPhase=arcadePhase;
+  arcadeTick();
+  if(arcadeOver) { drawArcade(); return; }
+  bool dirty=(oldScore!=arcadeScore || oldLane!=arcadeLane || oldPos!=arcadePos || oldPhase!=arcadePhase);
+  bool l=takeShort(btnLeft), r=takeShort(btnRight), m=takeShort(btnSelect);
+  if(arcadeId==0 && m) arcadeInput(1);
+  else if(arcadeId==1) {if(l)arcadeInput(0);if(r)arcadeInput(2);}
+  else if(arcadeId==2 && m) arcadeInput(1);
+  else if(arcadeId==3 && arcadePhase==1) {if(l)arcadeInput(0);if(m)arcadeInput(1);if(r)arcadeInput(2);}
+  else if(arcadeId==4 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==5) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
+  else if(arcadeId==6 && (l||m||r)) arcadeInput(l?0:m?1:2);
+  else if(arcadeId==7) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
+  else if(arcadeId==8) {if(l)arcadeInput(0);if(r)arcadeInput(2);if(m)arcadeInput(1);}
+  else if(arcadeId==9 && m) arcadeInput(1);
+  static uint32_t lastDraw=0;
+  if(dirty || millis()-lastDraw>75 || arcadeOver){lastDraw=millis();drawArcade();}
 }
 
 // =========================================================
@@ -3296,20 +2614,10 @@ void enterSelected() {
     if (idx == 0) { pwdListIdx = 0; currentScreen = SCR_PWD_LIST; drawPwdList(); }
     if (idx == 1) { currentScreen = SCR_SNIFFER; startSniffer(); }
   }
-  // Games: плоское меню, включая головоломку Reactor
+  // Ten newly designed games replace the old arcade collection.
   else if (currentMenuIdx == 7) {
     btnLeft.fireOnPress = false; btnRight.fireOnPress = false;
-    if (idx == 0) { snInit(); currentScreen = SCR_SNAKE; drawSnake(); }
-    if (idx == 1) { pInit(); currentScreen = SCR_PONG; drawPong(); }
-    if (idx == 2) { fInit(); currentScreen = SCR_FLAPPY; drawFlappy(); }
-    if (idx == 3) { doodInit(); currentScreen = SCR_DOODLE; drawDoodle(); }
-    if (idx == 4) { msInit(); currentScreen = SCR_MINES; drawMines(); }
-    if (idx == 5) { g2048Init(); currentScreen = SCR_2048; draw2048(); }
-    if (idx == 6) { simInit(); currentScreen = SCR_SIMON; drawSimon(); }
-    if (idx == 7) { tInit(); currentScreen = SCR_TETRIS; drawTetris(); }
-    if (idx == 8) { bjInit(1); currentScreen = SCR_BJ; drawBJ(); }
-    if (idx == 9) { if (!farmStarted) farmInit(); currentScreen = SCR_FARM; drawFarm(); }
-    if (idx == 10) { reactorStartGame(); currentScreen = SCR_REACTOR; drawReactor(); }
+    arcadeStart(idx); currentScreen = SCR_ARCADE; drawArcade();
   }
   else if (currentMenuIdx == 8) {
     if (idx == 0) { currentScreen = SCR_INFO; drawInfo(); }
@@ -3363,208 +2671,7 @@ void handleInput() {
 // =========================================================
 void handleTestScreen() {
   if (currentScreen == SCR_INPUT) { handleInput(); return; }
-  // --- TETRIS ---
-  if (currentScreen == SCR_TETRIS) {
-    if (tGameOver) {
-      if (takeLong(btnSelect)) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if ((int)tScore > hiTetris) { hiTetris = tScore; saveHighScore("tetris", hiTetris); } tInit(); drawTetris(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeShort(btnSelect)) { tPaused = !tPaused; drawTetris(); return; }
-    if (takeShort(btnLeft))  { if (tCanPlace(tCurType, tCurRot, tCurX - 1, tCurY)) { tCurX--; drawTetris(); } return; }
-    if (takeShort(btnRight)) { if (tCanPlace(tCurType, tCurRot, tCurX + 1, tCurY)) { tCurX++; drawTetris(); } return; }
-    if (takeLong(btnLeft)) { int nr = (tCurRot + 1) % 4; if (tCanPlace(tCurType, nr, tCurX, tCurY)) { tCurRot = nr; drawTetris(); } return; }
-    if (takeLong(btnRight)) { tLastDrop = millis() - T_DROP_MS; return; }
-    tStep();
-    if (tGameOver && (int)tScore > hiTetris) { hiTetris = tScore; saveHighScore("tetris", hiTetris); }
-    static uint32_t ltd = 0;
-    if (millis() - ltd > 100) { ltd = millis(); drawTetris(); }
-    return;
-  }
-  // --- PONG ---
-  if (currentScreen == SCR_PONG) {
-    if (pGameOver) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { pInit(); drawPong(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeShort(btnLeft))  { pPaddleX = max(0, pPaddleX - 8); drawPong(); return; }
-    if (takeShort(btnRight)) { pPaddleX = min(SW - P_PW, pPaddleX + 8); drawPong(); return; }
-    pStep();
-    static uint32_t ltp = 0;
-    if (millis() - ltp > 50) { ltp = millis(); drawPong(); }
-    return;
-  }
-  // --- FLAPPY ---
-  if (currentScreen == SCR_FLAPPY) {
-    if (fGameOver) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if (fScore > hiFlappy) { hiFlappy = fScore; saveHighScore("flappy", hiFlappy); } fInit(); drawFlappy(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    // v24.2: flap на L/R, M свободен (только restart после game over)
-    if (takeShort(btnLeft) || takeShort(btnRight)) { fFlap(); drawFlappy(); return; }
-    fStep();
-    if (fGameOver && fScore > hiFlappy) { hiFlappy = fScore; saveHighScore("flappy", hiFlappy); }
-    static uint32_t ltf = 0;
-    if (millis() - ltf > 50) { ltf = millis(); drawFlappy(); }
-    return;
-  }
-  // --- DOODLE ---
-  if (currentScreen == SCR_DOODLE) {
-    if (dGameOver) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if (dCam / 10 > hiDoodle) { hiDoodle = dCam / 10; saveHighScore("doodle", hiDoodle); } doodInit(); drawDoodle(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeShort(btnLeft))  { dBirdX -= 5; if (dBirdX < 0) dBirdX = 0; return; }
-    if (takeShort(btnRight)) { dBirdX += 5; if (dBirdX > SW - 4) dBirdX = SW - 4; return; }
-    doodStep();
-    if (dGameOver && dCam / 10 > hiDoodle) { hiDoodle = dCam / 10; saveHighScore("doodle", hiDoodle); }
-    static uint32_t ltdd = 0;
-    if (millis() - ltdd > 50) { ltdd = millis(); drawDoodle(); }
-    return;
-  }
-  // --- BLACKJACK ---
-  if (currentScreen == SCR_BJ || currentScreen == SCR_BJM) {
-    if (bjGameOver) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { bjInit(bjHands); drawBJ(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { if (bjHands == 1) bjStand(0); else bjStand(bjHand); bjFinish(); drawBJ(); return; }
-    if (bjHands > 1) {
-      if (takeShort(btnLeft) && bjHand > 0) { bjHand--; drawBJ(); return; }
-      if (takeShort(btnRight) && bjHand < bjHands - 1) { bjHand++; drawBJ(); return; }
-      if (takeShort(btnSelect)) { bjHit(bjHand); bjFinish(); drawBJ(); return; }
-      return;
-    }
-    if (takeShort(btnLeft))  { bjHit(0); bjFinish(); drawBJ(); return; }
-    if (takeShort(btnRight)) { bjStand(0); bjFinish(); drawBJ(); return; }
-    return;
-  }
-  // --- REACTOR ROUTE ---
-  if (currentScreen == SCR_REACTOR) {
-    if (takeLong(btnSelect)) {
-      btnLeft.fireOnPress = true; btnRight.fireOnPress = true;
-      currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return;
-    }
-    if (reactorSolved) {
-      if (takeShort(btnSelect)) { reactorScore++; reactorGenerate(); drawReactor(); }
-      return;
-    }
-    if (takeShort(btnLeft)) { reactorCursor = (reactorCursor + RX_CELLS - 1) % RX_CELLS; drawReactor(); return; }
-    if (takeShort(btnRight)) { reactorCursor = (reactorCursor + 1) % RX_CELLS; drawReactor(); return; }
-    if (takeShort(btnSelect)) {
-      reactorTiles[reactorCursor] = reactorRotate(reactorTiles[reactorCursor], 1);
-      reactorMoves++;
-      if (reactorHasPowerPath()) {
-        reactorSolved = true;
-        if (reactorScore + 1 > hiReactor) { hiReactor = reactorScore + 1; saveHighScore("reactor", hiReactor); }
-      }
-      drawReactor(); return;
-    }
-    return;
-  }
-  // --- FARM ---
-  if (currentScreen == SCR_FARM) {
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeShort(btnLeft) && farmSel > 0) { farmSel--; drawFarm(); return; }
-    if (takeShort(btnRight) && farmSel < FARM_PLOTS - 1) { farmSel++; drawFarm(); return; }
-    if (takeShort(btnSelect)) { farmAction(); drawFarm(); return; }
-    if (takeLong(btnLeft)) { farmUpgrade(); drawFarm(); return; }
-    static uint32_t ltfarm = 0;
-    if (millis() - ltfarm > 500) { ltfarm = millis(); drawFarm(); }
-    return;
-  }
-  // --- SNAKE ---
-  if (currentScreen == SCR_SNAKE) {
-    if (snGameOver) {
-      if (takeLong(btnSelect)) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if (snLen > hiSnake) { hiSnake = snLen; saveHighScore("snake", hiSnake); } snInit(); drawSnake(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (takeShort(btnSelect)) { snPaused = !snPaused; drawSnake(); return; }
-    if (takeShort(btnLeft) && !snPaused)  { snDir = (snDir + 3) % 4; return; }
-    if (takeShort(btnRight) && !snPaused) { snDir = (snDir + 1) % 4; return; }
-    snStep();
-    if (snGameOver && snLen > hiSnake) { hiSnake = snLen; saveHighScore("snake", hiSnake); }
-    static uint32_t lts = 0;
-    if (millis() - lts > 100) { lts = millis(); drawSnake(); }
-    return;
-  }
-  // --- 2048 ---
-  if (currentScreen == SCR_2048) {
-    if (g2048Over || g2048Won) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if ((int)g2048Score > hi2048) { hi2048 = g2048Score; saveHighScore("g2048", hi2048); } g2048Init(); draw2048(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    int dir = -1;
-    if (takeShort(btnLeft))  dir = 0;
-    if (takeShort(btnRight)) dir = 1;
-    if (takeLong(btnLeft))   dir = 2;
-    if (takeLong(btnRight))  dir = 3;
-    if (dir >= 0) {
-      if (g2048Slide(dir)) { g2048Spawn(); g2048Check(); }
-      if ((int)g2048Score > hi2048) { hi2048 = g2048Score; saveHighScore("g2048", hi2048); }
-      draw2048(); return;
-    }
-    return;
-  }
-  // --- SIMON ---
-  if (currentScreen == SCR_SIMON) {
-    if (simGameOver) {
-      if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { if (simLen > hiSimon) { hiSimon = simLen; saveHighScore("simon", hiSimon); } simInit(); drawSimon(); }
-      return;
-    }
-    if (takeLong(btnSelect)) { currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-    if (!simShowing && simFlash < 0) {
-      if (takeShort(btnLeft))  simPress(0);
-      if (takeShort(btnSelect)) simPress(1);
-      if (takeShort(btnRight)) simPress(2);
-    }
-    simStep();
-    if (simGameOver && simLen > hiSimon) { hiSimon = simLen; saveHighScore("simon", hiSimon); }
-    static uint32_t ltsim = 0;
-    if (millis() - ltsim > 60) { ltsim = millis(); drawSimon(); }
-    return;
-  }
-  // --- MINES ---
-  if (currentScreen == SCR_MINES) {
-    if (msGameOver || msWon) {
-      if (takeLong(btnSelect)) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      if (takeShort(btnSelect)) { msInit(); drawMines(); }
-      return;
-    }
-    int x = msCurIdx % MS_SIZE, y = msCurIdx / MS_SIZE;
-    if (takeShort(btnLeft))  { x = (x + MS_SIZE - 1) % MS_SIZE; msCurIdx = y * MS_SIZE + x; drawMines(); return; }
-    if (takeShort(btnRight)) { x = (x + 1) % MS_SIZE; msCurIdx = y * MS_SIZE + x; drawMines(); return; }
-    if (takeLong(btnLeft))   { y = (y + MS_SIZE - 1) % MS_SIZE; msCurIdx = y * MS_SIZE + x; drawMines(); return; }
-    if (takeLong(btnRight))  { y = (y + 1) % MS_SIZE; msCurIdx = y * MS_SIZE + x; drawMines(); return; }
-    if (takeShort(btnSelect)) {
-      if (!msGrid[y][x].flag) {
-        if (!msMinesPlaced) { msPlaceMines(x, y); msMinesPlaced = true; }
-        msReveal(x, y);
-        if (msOpened == MS_SIZE * MS_SIZE - MS_MINES) msWon = true;
-      }
-      drawMines(); return;
-    }
-    if (takeLong(btnSelect)) {
-      if (msGrid[y][x].open) { btnLeft.fireOnPress = true; btnRight.fireOnPress = true; currentMenuIdx = testParentMenu; currentScreen = SCR_MENU; drawCurrentMenu(); return; }
-      msGrid[y][x].flag = !msGrid[y][x].flag;
-      msFlags += msGrid[y][x].flag ? 1 : -1;
-      drawMines(); return;
-    }
-    return;
-  }
+  if (currentScreen == SCR_ARCADE) { handleArcade(); return; }
   // --- IR POWER ---
   if (currentScreen == SCR_IR_POWER) {
     if (macroRecording) {
@@ -4001,7 +3108,7 @@ void setup() {
   irSend.begin();
   randomSeed(esp_random());
   WiFi.mode(WIFI_OFF); WiFi.persistent(false);
-  loadCreds(); loadBattCal(); loadMap(); loadMacros(); loadIrFavorites(); loadHighScores();
+  loadCreds(); loadBattCal(); loadMap(); loadMacros(); loadIrFavorites();
   analogReadResolution(12);
   battFirstDone = false;
   lastBattSample = millis();
