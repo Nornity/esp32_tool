@@ -1,6 +1,6 @@
 # Tricorder — ESP32-C3 SuperMini
 
-Прошивка для ESP32-C3 SuperMini с OLED 128×64, тремя кнопками, аккумулятором и ИК-светодиодом. Основной скетч: [`sketch_nov7a.ino`](sketch_nov7a.ino).
+Прошивка для ESP32-C3 SuperMini с OLED 128×64, тремя кнопками, аккумулятором и ИК-светодиодом. Основной скетч: [`sketch_nov7a.ino`](sketch_nov7a.ino). Полный исходный код проекта одним архивом: [`tricorder_source.zip`](tricorder_source.zip).
 
 ## Подключения в скетче
 
